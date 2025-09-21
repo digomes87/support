@@ -1,156 +1,54 @@
-from datetime import datetime
+def get_partition_filter(database_name, table_name, glue_client):
+    table_partitions = []
+    table_info = glue_client.get_table(
+        DatabaseName=database_name,
+        Name=table_name,
+    )["Table"]
+    partition_info = glue_client.get_partitions(
+        DatabaseName=database_name, TableName=table_name, ExcludeColumnSchema=True
+    )
 
-import pyspark.sql.functions as F
-from pyspark.sql.types import LongType, StructField, StructType
-from utils.update_datacatalog import update_table_data_catalog
-from utils.logging_config import AWSServiceError, DataProcessingError
+    while True:
+        if len(partition_info["Partitions"]) != 0:
+            for partition in partition_info["Partitions"]:
+                table_partitions.append(
+                    {
+                        "Values": partition["Values"],
+                        "CreationTime": partition["CreationTime"],
+                    }
+                )
 
-
-def escrita_dados(
-    resultado_df,
-    numero_lote_spec,
-    logger,
-    glue_client_role,
-    database_name_spec,
-    table_name_spec,
-    lake_control_account_id,
-    s3_client,
-    s3_bucket_name=None,
-    s3_bucket_prefix=None):
-    """Write data to S3 and update data catalog with comprehensive error handling."""
-    try:
-        # Validate input parameters
-        if resultado_df is None or resultado_df.count() == 0:
-            raise DataProcessingError("Empty or null DataFrame provided", "data_validation", 
-                                    {"table": table_name_spec})
-        
-        if numero_lote_spec <= 0:
-            raise DataProcessingError("Invalid batch number", "parameter_validation", 
-                                    {"numero_lote_spec": numero_lote_spec})
-
-        logger.log_operation_start("Batch Number Assignment", batch_size=numero_lote_spec)
-        
-        # Assign batch number
-        try:
-            partition_col = datetime.now().strftime("%Y%m%d")
-            resultado_df = atribui_num_lote(resultado_df, numero_lote_spec)
-            logger.log_operation_end("Batch Number Assignment")
-        except Exception as e:
-            raise DataProcessingError("Failed to assign batch numbers", "batch_assignment", 
-                                    {"error": str(e), "batch_size": numero_lote_spec})
-
-        # Get table location and storage descriptor
-        try:
-            logger.log_operation_start("Table Metadata Retrieval", 
-                                     database=database_name_spec, 
-                                     table=table_name_spec)
-            location, storage_descriptor = get_table_location_storage_descriptor(
-                glue_client_role,
-                database_name_spec,
-                table_name_spec,
-                lake_control_account_id
-            )
-            logger.log_aws_operation("Glue", "Get Table Metadata", "SUCCESS", 
-                                   table=table_name_spec, 
-                                   location=location)
-        except Exception as e:
-            raise AWSServiceError("Failed to retrieve table metadata", "glue_metadata", 
-                                {"database": database_name_spec, "table": table_name_spec, "error": str(e)})
-
-        # Write to S3
-        try:
-            logger.log_operation_start("S3 Data Write", 
-                                     location=location, 
-                                     partition_column=partition_col)
-            write_to_s3(
-                resultado_df,
-                location, 
-                partition_col, 
-                logger
-            )
-            logger.log_aws_operation("S3", "Data Write", "SUCCESS", 
-                                   location=location, 
-                                   partition=f"num_ano_mes_dia={partition_col}")
-        except Exception as e:
-            raise AWSServiceError("Failed to write data to S3", "s3_write", 
-                                {"location": location, "error": str(e)})
-
-        # Update data catalog
-        try:
-            logger.log_operation_start("Data Catalog Update", 
-                                     database=database_name_spec, 
-                                     table=table_name_spec)
-            update_table_data_catalog(
-                partition_col,
-                storage_descriptor,
-                logger,
-                glue_client_role,
-                database_name_spec,
-                table_name_spec,
-                lake_control_account_id,
-                s3_client
-            )
-            logger.log_aws_operation("Glue", "Update Data Catalog", "SUCCESS", 
-                                   table=table_name_spec, 
-                                   partition=f"num_ano_mes_dia={partition_col}")
-        except Exception as e:
-            raise AWSServiceError("Failed to update data catalog", "catalog_update", 
-                                {"database": database_name_spec, "table": table_name_spec, "error": str(e)})
-
-        logger.log_operation_end("Data Writing Process")
-        
-    except (DataProcessingError, AWSServiceError) as e:
-        logger.log_error_with_context(e, e.operation, **e.context)
-        raise
-    except Exception as e:
-        logger.log_error_with_context(e, "data_writing_unknown_error", 
-                                    table=table_name_spec, 
-                                    database=database_name_spec)
-        raise DataProcessingError("Unexpected error during data writing", "data_writing_unknown_error", 
-                                {"table": table_name_spec, "error": str(e)})
-
-def get_table_location_storage_descriptor(
-    glue_client_role,
-    database_name_spec,
-    table_name_spec,
-    lake_control_account_id):
-
-    storage_descriptor = glue_client_role.get_table(
-        DatabaseName=database_name_spec,
-        Name=table_name_spec,
-        CatalogId=lake_control_account_id
-    )['Table']['StorageDescriptor']
-    location = storage_descriptor['Location']
-
-    return location, storage_descriptor
-
-def write_to_s3(resultado_df, location, partition_col, logger):
-    for i in range(3):
-        try:
-            (
-                resultado_df
-                .write.format('json')
-                .partitionBy('num_lote')
-                .option('maxRecordsPerFile', 1)
-                .mode('overwrite')
-                .save(f"{location}/num_ano_mes_dia={partition_col}/")
-            )
+        next_token = partition_info.get("NextToken")
+        if not next_token:
             break
-        except Exception as e:
-            if i == 2:
-                raise e
-            else:
-                logger.warning(f"Erro na escrita {i}/2. Erro {e}")
 
-def atribui_num_lote(resultado_df, numero_lote_spec):
-    new_schema = StructType([StructField('index', LongType(), False)] + resultado_df.schema.fields[:])
-    resultado_df = (
-        resultado_df.rdd.zipWithIndex()
-        .map(lambda x: (x[1] + 1,) + x[0])
-        .toDF(schema=new_schema))
-    resultado_df = resultado_df.withColumn(
-        'num_lote',
-        ((F.col('index')/ numero_lote_spec)
-         .cast('int')+ 1)).drop('index')
+        partition_info = glue_client.get_partitions(
+            DatabaseName=database_name,
+            TableName=table_name,
+            ExcludeColumnSchema=True,
+            NextToken=partition_info["NextToken"],
+        )
 
-    return resultado_df
+    partitions_filter = ""
+    table_partitions_name = table_info["PartitionKeys"]
+
+    if len(table_partitions) == 0:
+        return partitions_filter
+
+    map_index = {}
+
+    for index, creation_time in enumerate(table_partitions):
+        map_index[index] = creation_time["CreationTime"]
+
+    max_partition = max(map_index, key=map_index.get)
+    partition = table_partitions[max_partition]["Values"]
+
+    for index2, p in enumerate(table_partitions_name):
+        name_partition = p["Name"]
+        value_partition = partition[index2].strip()
+        if index2 > 0 and partitions_filter != "":
+            partitions_filter += " and "
+
+        partitions_filter += f"{name_partition}={value_partition}"
+
+    return partitions_filter
