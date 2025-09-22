@@ -1,134 +1,158 @@
-import copy
-import re
-from typing import Any, List, Dict, Optional
+from datetime import datetime
+from typing import Any, Tuple, Optional
 
-import botocore
-from botocore.exceptions import ClientError
+import pyspark.sql.functions as F
+from pyspark.sql import DataFrame
+from pyspark.sql.types import LongType, StructField, StructType
+from utils.update_datacatalog import update_table_data_catalog
+from utils.logging_config import AWSServiceError, DataProcessingError
 
 
-def update_table_data_catalog(date_partition: str, storage_description: Dict[str, Any], logger: Any, glue_client_role: Any, database_name_spec: str, table_name_spec: str, lake_control_account_id: str, s3_client: Any) -> None:
-    logger.info(f'Criando particoes')
-    s3_location = storage_description['Location']
-    bucket_name = s3_location.split('/')[2]  # Extract bucket name from s3://bucket/path
-    s3_prefix = '/'.join(s3_location.split('/')[3:])  # Extract prefix from s3://bucket/path
-
-    limpa_particoes_existentes(database_name_spec, date_partition, glue_client_role, lake_control_account_id, table_name_spec)
-    lista_num_lote = get_lista_num_lote_from_s3(bucket_name, f'{s3_prefix}/num_ano_mes_dia={date_partition}', s3_client)
-
+def escrita_dados(
+    resultado_df: DataFrame,
+    numero_lote_spec: int,
+    logger: Any,
+    glue_client_role: Any,
+    database_name_spec: str,
+    table_name_spec: str,
+    lake_control_account_id: str,
+    s3_client: Any,
+    s3_bucket_name: Optional[str] = None,
+    s3_bucket_prefix: Optional[str] = None) -> None:
+    """Write data to S3 and update data catalog with comprehensive error handling."""
     try:
-        tamanho_lote = 200
-        for i in range(0, len(lista_num_lote), tamanho_lote):
-            list_lote_atual = lista_num_lote[i:i + tamanho_lote]
-
-            partition_inputs = []
-            for lote in list_lote_atual:
-                custom_storage_description = copy.deepcopy(storage_description)
-
-                custom_storage_description['Location'] = storage_description['Location'] + f"/num_ano_mes_dia={date_partition}/num_lote={lote}/"
-                partition_inputs.append(
-                        {
-                            'Values': [
-                                date_partition, lote
-                            ],
-                            "StorageDescriptor": custom_storage_description
-                        }
-                )
-            glue_client_role.batch_create_partition(DatabaseName=database_name_spec, TableName=table_name_spec, CatalogId=lake_control_account_id, PartitionInputList=partition_inputs)
-    except ClientError as error:
+        # Validate input parameters
+        if resultado_df is None or resultado_df.count() == 0:
+            raise DataProcessingError("Empty or null DataFrame provided", "data_validation", 
+                                    {"table": table_name_spec})
         
-        if error.response['Error']['Code'] == 'AlreadyExistsException':
-            logger.warning(f"Particao {date_partition} ja existe")
+        if numero_lote_spec <= 0:
+            raise DataProcessingError("Invalid batch number", "parameter_validation", 
+                                    {"numero_lote_spec": numero_lote_spec})
+
+        logger.log_operation_start("Batch Number Assignment", batch_size=numero_lote_spec)
         
-        elif error.response['Error']['Code'] == 'AccessDeniedException':
-            logger.warning(f"Erro de acesso a tabela: {table_name_spec}, sem permissao ou nao existe")
+        # Assign batch number
+        try:
+            partition_col = datetime.now().strftime("%Y%m%d")
+            resultado_df = atribui_num_lote(resultado_df, numero_lote_spec)
+            logger.log_operation_end("Batch Number Assignment")
+        except Exception as e:
+            raise DataProcessingError("Failed to assign batch numbers", "batch_assignment", 
+                                    {"error": str(e), "batch_size": numero_lote_spec})
 
-        elif error.response['Error']['Code'] == 'ExpiredTokenException':
-            logger.warning(f"Token de sessions AWS expirado, erro reproduzido ao tentar acessar {table_name_spec}")
+        # Get table location and storage descriptor
+        try:
+            logger.log_operation_start("Table Metadata Retrieval", 
+                                     database=database_name_spec, 
+                                     table=table_name_spec)
+            location, storage_descriptor = get_table_location_storage_descriptor(
+                glue_client_role,
+                database_name_spec,
+                table_name_spec,
+                lake_control_account_id
+            )
+            logger.log_aws_operation("Glue", "Get Table Metadata", "SUCCESS", 
+                                   table=table_name_spec, 
+                                   location=location)
+        except Exception as e:
+            raise AWSServiceError("Failed to retrieve table metadata", "glue_metadata", 
+                                {"database": database_name_spec, "table": table_name_spec, "error": str(e)})
 
-        else:
-            logger.error(f"Erro ao tentar gerar particao da tabela {table_name_spec}: {error}")
-            raise error
+        # Write to S3
+        try:
+            logger.log_operation_start("S3 Data Write", 
+                                     location=location, 
+                                     partition_column=partition_col)
+            write_to_s3(
+                resultado_df,
+                location, 
+                partition_col, 
+                logger
+            )
+            logger.log_aws_operation("S3", "Data Write", "SUCCESS", 
+                                   location=location, 
+                                   partition=f"num_ano_mes_dia={partition_col}")
+        except Exception as e:
+            raise AWSServiceError("Failed to write data to S3", "s3_write", 
+                                {"location": location, "error": str(e)})
 
-def limpa_particoes_existentes(database_name_spec: str, date_partition: str, glue_client_role: Any, lake_control_account_id: str, table_name_spec: str) -> None:
-    lista_particoes = get_lista_particoes_spec_from_catalog(date_partition, glue_client_role, database_name_spec, table_name_spec, lake_control_account_id)
+        # Update data catalog
+        try:
+            logger.log_operation_start("Data Catalog Update", 
+                                     database=database_name_spec, 
+                                     table=table_name_spec)
+            update_table_data_catalog(
+                partition_col,
+                storage_descriptor,
+                logger,
+                glue_client_role,
+                database_name_spec,
+                table_name_spec,
+                lake_control_account_id,
+                s3_client
+            )
+            logger.log_aws_operation("Glue", "Update Data Catalog", "SUCCESS", 
+                                   table=table_name_spec, 
+                                   partition=f"num_ano_mes_dia={partition_col}")
+        except Exception as e:
+            raise AWSServiceError("Failed to update data catalog", "catalog_update", 
+                                {"database": database_name_spec, "table": table_name_spec, "error": str(e)})
 
-    if len(lista_particoes) != 0:
-        delete_batch_spec_partitions(lista_particoes, glue_client_role, lake_control_account_id, database_name_spec, table_name_spec)
+        logger.log_operation_end("Data Writing Process")
+        
+    except (DataProcessingError, AWSServiceError) as e:
+        logger.log_error_with_context(e, e.operation, **e.context)
+        raise
+    except Exception as e:
+        logger.log_error_with_context(e, "data_writing_unknown_error", 
+                                    table=table_name_spec, 
+                                    database=database_name_spec)
+        raise DataProcessingError("Unexpected error during data writing", "data_writing_unknown_error", 
+                                {"table": table_name_spec, "error": str(e)})
 
-def lista_objetos_s3(bucket_name: str, prefixo: str, s3_client: Any, continuation_token: Optional[str] = None) -> Dict[str, Any]:
-    if continuation_token:
-        return s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefixo, Delimiter='/', ContinuationToken=continuation_token)
-    else:
-        return s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefixo, Delimiter='/')
+def get_table_location_storage_descriptor(
+    glue_client_role: Any,
+    database_name_spec: str,
+    table_name_spec: str,
+    lake_control_account_id: str) -> Tuple[str, Any]:
 
-def extrair_num_lote(pasta: str, exp_re: str) -> Optional[str]:
-    match_valor = re.search(exp_re, pasta['Prefix'])
-    if match_valor:
-        return match_valor.group(1)
-    return None
+    storage_descriptor = glue_client_role.get_table(
+        DatabaseName=database_name_spec,
+        Name=table_name_spec,
+        CatalogId=lake_control_account_id
+    )['Table']['StorageDescriptor']
+    location = storage_descriptor['Location']
 
-def get_lista_num_lote_from_s3(bucket_name: str, prefixo: str, s3_client: Any) -> List[str]:
-    pastas = set()
-    continua = True
-    continua_token = None
-    exp_re = r'num_lote=(\d+)'
+    return location, storage_descriptor
 
-    while continua:
-        resultado = lista_objetos_s3(bucket_name, prefixo, s3_client, continua_token)
-
-        if 'CommonPrefixes' in resultado:
-            for pasta in resultado['CommonPrefixes']:
-                num_lote = extrair_num_lote(pasta, exp_re)
-                if num_lote:
-                    pastas.add(num_lote)
-        continua_token = resultado.get('NextContinuationToken')
-        continua = continua_token is not None
-
-    list_num_lotes = sorted(pastas, key=int) if pastas else []
-
-    return list_num_lotes
-
-def get_lista_particoes_spec_from_catalog(num_ano_mes_dia: str, glue_client_role: Any, database_name_spec: str, table_name_spec: str, lake_control_account_id: str) -> List[Dict[str, Any]]:
-    list_particoes = []
-
-    partition_info = glue_client_role.get_partitions(
-            DatabaseName=database_name_spec,
-            TableName=table_name_spec,
-            ExcludeColumnSchema=True,
-            Expression=f"num_ano_mes_dia={num_ano_mes_dia}",
-            CatalogId=lake_control_account_id
-    )
-
-    while True:
-        if partition_info.get('Partitions'):
-            for partition in partition_info['Partitions']:
-                if len(partition['Values']) != 0:
-                    list_particoes.append({'Values': partition['Values']})
-
-        next_token = partition_info.get('NextToken')
-        if not next_token:
+def write_to_s3(resultado_df: DataFrame, location: str, partition_col: str, logger: Any) -> None:
+    for i in range(3):
+        try:
+            (
+                resultado_df
+                .write.format('json')
+                .partitionBy('num_lote')
+                .option('maxRecordsPerFile', 1)
+                .mode('overwrite')
+                .save(f"{location}/num_ano_mes_dia={partition_col}/")
+            )
             break
+        except Exception as e:
+            if i == 2:
+                raise e
+            else:
+                logger.warning(f"Erro na escrita {i}/2. Erro {e}")
 
-        partition_info = glue_client_role.get_partitions(
-                DatabaseName=database_name_spec,
-                TableName=table_name_spec,
-                ExcludeColumnSchema=True,
-                NextToken=next_token,
-                Expression=f"num_ano_mes_dia={num_ano_mes_dia}",
-                CatalogId=lake_control_account_id
-        )
+def atribui_num_lote(resultado_df: DataFrame, numero_lote_spec: int) -> DataFrame:
+    new_schema = StructType([StructField('index', LongType(), False)] + resultado_df.schema.fields[:])
+    resultado_df = (
+        resultado_df.rdd.zipWithIndex()
+        .map(lambda x: (x[1],) + x[0])
+        .toDF(schema=new_schema))
+    resultado_df = resultado_df.withColumn(
+        'num_lote',
+        ((F.col('index') / numero_lote_spec)
+         .cast('int') + 1)).drop('index')
 
-    return list_particoes
-
-def delete_batch_spec_partitions(lista_particoes: List[Dict[str, Any]], glue_client_role: Any, lake_control_account_id: str, database_name_spec: str, table_name_spec: str) -> None:
-    tamanho_lote = 30
-    for i in range(0, len(lista_particoes), tamanho_lote):
-        lote_atual = lista_particoes[i:i + tamanho_lote]
-        glue_client_role.batch_delete_partition(
-            CatalogId=lake_control_account_id,
-            DatabaseName=database_name_spec,
-            TableName=table_name_spec,
-            PartitionsToDelete=lote_atual
-        )
-
-
+    return resultado_df
