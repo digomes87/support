@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Any
 
 import pyspark.sql.functions as F
 from awsglue.context import GlueContext
@@ -20,7 +20,7 @@ DECIMAL = DecimalType(10, 2)
 TiMESTAMP = TimestampType()
 
 
-def safe_numeric_cast(field_name, target_type="STRING", alias_name=None):
+def safe_numeric_cast(field_name: str, target_type: str = "STRING", alias_name: Optional[str] = None) -> str:
     """
     Creates a safe cast for numeric fields that might be INT or DOUBLE in Hive.
 
@@ -49,7 +49,7 @@ def safe_numeric_cast(field_name, target_type="STRING", alias_name=None):
         return f"CAST({field_name} AS {target_type}) AS {alias_name}"
 
 
-def safe_numeric_where_condition(field_name, value, operator="="):
+def safe_numeric_where_condition(field_name: str, value: float, operator: str = "=") -> str:
     """
     Creates a safe WHERE condition for numeric fields that might be INT or DOUBLE.
 
@@ -97,7 +97,7 @@ COLUMN_TYPE = {
 }
 
 
-def consulta_tabelas_main(logger, glue_client, spark, glue_context):
+def consulta_tabelas_main(logger: Any, glue_client: Any, spark: SparkSession, glue_context: GlueContext) -> Optional[DataFrame]:
     """
     Main function to query tables and return a consolidated dataframe.
     Enhanced with comprehensive error handling and data validation.
@@ -231,7 +231,7 @@ def consulta_tabelas_main(logger, glue_client, spark, glue_context):
                                 error_context)
 
 
-def get_consultas_keyspace(glue_client, logger, query_correntista, spark):
+def get_consultas_keyspace(glue_client: Any, logger: Any, query_correntista: str, spark: SparkSession) -> Optional[DataFrame]:
     """
     Enhanced keyspace query function using the new database mapping system.
     Provides better maintainability and standardized table access.
@@ -373,7 +373,7 @@ def get_consultas_keyspace(glue_client, logger, query_correntista, spark):
         return resultado_df
 
 
-def get_consulta_aurora(glue_client, logger, query_correntista, resultado_df, spark):
+def get_consulta_aurora(glue_client: Any, logger: Any, query_correntista: str, resultado_df: Optional[DataFrame], spark: SparkSession) -> Optional[DataFrame]:
     """
     Enhanced Aurora query function using the new database mapping system.
     Provides better maintainability and standardized table access.
@@ -458,7 +458,7 @@ def get_consulta_aurora(glue_client, logger, query_correntista, resultado_df, sp
     return resultado_df
 
 
-def get_consulta_aurora_legacy(glue_client, logger, query_correntista, resultado_df, spark):
+def get_consulta_aurora_legacy(glue_client: Any, logger: Any, query_correntista: str, resultado_df: Optional[DataFrame], spark: SparkSession) -> Optional[DataFrame]:
     """
     Legacy Aurora query function - maintained for backward compatibility.
     TODO: Remove after full migration to mapped system.
@@ -619,6 +619,7 @@ def consulta_tabelas_mapped(
         return resultado_df
     
     # Build query using mapping configuration
+    query = None  # Initialize query variable
     try:
         full_table_name, select_clause, where_clause = get_mapped_query_parts(
             table_key, select_fields, where_conditions
@@ -627,6 +628,7 @@ def consulta_tabelas_mapped(
         query = f"SELECT {select_clause} FROM {full_table_name}"
         
         # Add partition filter with enhanced error handling
+        ultima_particao = None  # Initialize variable
         try:
             ultima_particao = get_partition_filter(
                 database_name=table_mapping.database, 
@@ -672,21 +674,25 @@ def consulta_tabelas_mapped(
         return resultado_df
         
     except Exception as e:
-        logger.error(f"Error querying mapped table {table_key}: {str(e)}")
+        if query:
+            logger.error(f"Error executing mapped query: {query}")
+        else:
+            logger.error(f"Error building query for table '{table_key}'")
+        logger.error(f"Error details: {str(e)}")
         return resultado_df
 
 
 def consulta_tabelas(
-    resultado_df,
-    logger,
-    glue_client,
-    spark,
-    conv,
-    db,
-    tabela,
-    select_campos,
-    where_cond="",
-):
+    resultado_df: Optional[DataFrame],
+    logger: Any,
+    glue_client: Any,
+    spark: SparkSession,
+    conv: str,
+    db: str,
+    tabela: str,
+    select_campos: str,
+    where_cond: str = "",
+) -> Optional[DataFrame]:
     """
     Legacy table query function - maintained for backward compatibility.
     Consider using consulta_tabelas_mapped for new implementations.
@@ -694,19 +700,23 @@ def consulta_tabelas(
     logger.info(f"Buscando dados da tabela: {db}.{tabela}")
     query = f"SELECT {select_campos} FROM {db}.{tabela}"
 
+    ultima_particao = ""  # Initialize variable
     try:
         ultima_particao = get_partition_filter(
             database_name=db, table_name=tabela, glue_client=glue_client
         )
     except glue_client.exceptions.EntityNotFoundException:
-        logger.warning(f"Tabela {db}.{tabela}: {ultima_particao}")
-        if ultima_particao != "" or where_cond != "":
-            if ultima_particao != "" and where_cond != "" and conv != 1:
-                query += f" WHERE ({ultima_particao}) AND ({where_cond})"
-            elif ultima_particao != "" and conv != 1:
-                query += f" WHERE {ultima_particao}"
-            else:
-                query += f" WHERE {where_cond}"
+        logger.warning(f"Tabela {db}.{tabela}: Partition not found, proceeding without partition filter")
+        ultima_particao = ""  # Set to empty string if partition not found
+    
+    # Apply filters based on available conditions
+    if ultima_particao != "" or where_cond != "":
+        if ultima_particao != "" and where_cond != "" and conv != 1:
+            query += f" WHERE ({ultima_particao}) AND ({where_cond})"
+        elif ultima_particao != "" and conv != 1:
+            query += f" WHERE {ultima_particao}"
+        elif where_cond != "":
+            query += f" WHERE {where_cond}"
 
     logger.info(f"Query: {query}")
     tabela_df = spark.sql(query)
@@ -793,7 +803,7 @@ def create_data_frame(
     return df
 
 
-def add_missing_columns_with_nulls(df, logger=None):
+def add_missing_columns_with_nulls(df: Optional[DataFrame], logger=None) -> Optional[DataFrame]:
     if logger:
         logger.info("Tratamento colunas vazias")
 
@@ -814,7 +824,7 @@ def add_missing_columns_with_nulls(df, logger=None):
     return df
 
 
-def get_publico_correntista(logger, glue_client):
+def get_publico_correntista(logger: Any, glue_client: Any) -> str:
     query_correntista = (
         "SELECT cod_idef_pess FROM "
         "ricdb.tbfc66706_pubi_vsao_pess WHERE cod_tipo_cont='C' AND cod_cont_ativ= 1"
@@ -828,7 +838,7 @@ def get_publico_correntista(logger, glue_client):
     return query_correntista
 
 
-def get_convenios(logger, glue_client):
+def get_convenios(logger: Any, glue_client: Any) -> str:
     query_convenios = (
         "SELECT nrmaer FROM "
         "db_corp_servicosdecontratacao_consignado_sor_01.tbazcma WHERE tpempseg=2 "
@@ -842,7 +852,7 @@ def get_convenios(logger, glue_client):
     return query_convenios
 
 
-def get_agded(logger, glue_client):
+def get_agded(logger: Any, glue_client: Any) -> str:
     query_agded = (
         "SELECT cdagecdt, cdctacdt FROM "
         "db_corp_servicosdecontratacao_consignado_sor_01.tbazcma WHERE tpempseg=2 "
