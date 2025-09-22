@@ -1,6 +1,7 @@
 import sys
 import time
 import boto3
+from botocore.exceptions import ClientError
 
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -73,10 +74,10 @@ def main():
             s3_client = aws_session.client("s3")
             
             logger.log_aws_operation("RefreshableBotoSession", "Client Setup", "SUCCESS")
-        except (boto3.exceptions.Boto3Error, Exception) as e:
+        except (ClientError, Exception) as e:
             # Only catch AWS-specific errors and convert to AWSServiceError
             # Let other unexpected exceptions bubble up to the general handler
-            if isinstance(e, boto3.exceptions.Boto3Error) or "AWS" in str(e) or "boto" in str(e).lower():
+            if isinstance(e, ClientError) or "AWS" in str(e) or "boto" in str(e).lower():
                 raise AWSServiceError("Failed to configure AWS clients", "aws_setup", {"role_arn": args.get("ROLE_ARN_DATAMESH")})
             else:
                 # Re-raise unexpected exceptions to be handled by the general exception handler
