@@ -7,7 +7,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import (DecimalType, DoubleType, IntegerType,
                                StringType, TimestampType)
 from utils.get_partition_filter import get_partition_filter
-from utils.database_mapping import db_mapping, build_standardized_query, get_mapped_query_parts
+from utils.database_mapping import db_mapping, get_mapped_query_parts
 from utils.logging_config import ETLException, AWSServiceError, DataProcessingError, DataValidationError
 
 spark = SparkSession.builder.getOrCreate()
@@ -568,7 +568,7 @@ def consulta_tabelas_mapped(
     where_conditions: Optional[List[str]] = None,
     join_key: str = "cod_idef_pess",
     join_type: str = "left"
-) -> DataFrame:
+) -> Optional[DataFrame]:
     """
     Enhanced table query function using database mapping configuration.
     
