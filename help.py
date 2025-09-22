@@ -1,89 +1,116 @@
-from datetime import datetime, timedelta
-from typing import Dict, Any
+"""
+Centralized logging configuration for the ETL pipeline.
+Provides consistent logging setup and error handling utilities.
+"""
 
-from boto3 import Session
-from botocore.credentials import RefreshableCredentials
-from botocore.session import get_session
-from dateutil import tz
-from utils.logging_config import ETLLogger
+import logging
+import sys
+from typing import Optional
 
 
-class RefreshableBotoSession:
-    def __init__(
-        self,
-        region_name: str = "sa-east-1",
-        profile_name: str = None,
-        sts_arn: str = None,
-        session_name: str = None,
-        session_ttl: int = 900,
-    ):
-        self.region_name = region_name
-        self.profile_name = profile_name
-        self.sts_arn = sts_arn
-        self.session_name = session_name or f"session-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        self.session_ttl = session_ttl
-        self.logger = ETLLogger(__name__)
+class ETLLogger:
+    """Enhanced logger for ETL operations with structured logging."""
+    
+    def __init__(self, name: str, level: int = logging.INFO):
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(level)
+        
+        # Avoid duplicate handlers
+        if not self.logger.handlers:
+            self._setup_handlers()
+    
+    def _setup_handlers(self):
+        """Setup console and file handlers with proper formatting."""
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        self.logger.addHandler(console_handler)
+        
+        # File handler for errors
+        error_handler = logging.FileHandler('etl_errors.log')
+        error_handler.setLevel(logging.ERROR)
+        error_handler.setFormatter(formatter)
+        self.logger.addHandler(error_handler)
+    
+    def log_operation_start(self, operation: str, **kwargs):
+        """Log the start of an ETL operation with context."""
+        context = ', '.join([f"{k}={v}" for k, v in kwargs.items()])
+        self.logger.info(f"Starting {operation} - {context}")
+    
+    def log_operation_end(self, operation: str, duration: Optional[float] = None):
+        """Log the completion of an ETL operation."""
+        duration_str = f" (Duration: {duration:.2f}s)" if duration else ""
+        self.logger.info(f"Completed {operation}{duration_str}")
+    
+    def log_data_quality(self, stage: str, record_count: int, **metrics):
+        """Log data quality metrics."""
+        metrics_str = ', '.join([f"{k}={v}" for k, v in metrics.items()])
+        self.logger.info(f"Data Quality - {stage}: {record_count} records, {metrics_str}")
+    
+    def log_error_with_context(self, error: Exception, operation: str, **context):
+        """Log errors with detailed context for debugging."""
+        context_str = ', '.join([f"{k}={v}" for k, v in context.items()])
+        self.logger.error(
+            f"Error in {operation}: {str(error)} - Context: {context_str}",
+            exc_info=True
+        )
+    
+    def log_aws_operation(self, service: str, operation: str, status: str, **details):
+        """Log AWS service operations."""
+        details_str = ', '.join([f"{k}={v}" for k, v in details.items()])
+        self.logger.info(f"AWS {service} - {operation}: {status} - {details_str}")
+    
+    # Delegate standard logging methods to the underlying logger
+    def debug(self, message, *args, **kwargs):
+        """Log a debug message."""
+        return self.logger.debug(message, *args, **kwargs)
+    
+    def info(self, message, *args, **kwargs):
+        """Log an info message."""
+        return self.logger.info(message, *args, **kwargs)
+    
+    def warning(self, message, *args, **kwargs):
+        """Log a warning message."""
+        return self.logger.warning(message, *args, **kwargs)
+    
+    def error(self, message, *args, **kwargs):
+        """Log an error message."""
+        return self.logger.error(message, *args, **kwargs)
+    
+    def critical(self, message, *args, **kwargs):
+        """Log a critical message."""
+        return self.logger.critical(message, *args, **kwargs)
 
-    def __get_session_credentials(self) -> Dict[str, Any]:
-        """Get session credentials either from STS assume role or current session."""
-        try:
-            session = Session(region_name=self.region_name, profile_name=self.profile_name)
 
-            if self.sts_arn:
-                self.logger.info(f"Assuming role: {self.sts_arn}")
-                sts_client = session.client(
-                    service_name="sts", region_name=self.region_name
-                )
-                response = sts_client.assume_role(
-                    RoleArn=self.sts_arn,
-                    RoleSessionName=self.session_name,
-                    DurationSeconds=self.session_ttl,
-                ).get("Credentials")
+def get_etl_logger(name: str) -> ETLLogger:
+    """Factory function to get a configured ETL logger."""
+    return ETLLogger(name)
 
-                utc_exp: datetime = response.get("Expiration")
-                credentials = {
-                    "access_key": response.get("AccessKeyId"),
-                    "secret_key": response.get("SecretAccessKey"),
-                    "token": response.get("SessionToken"),
-                    "expiry_time": utc_exp.astimezone(tz.tzlocal()).isoformat(),
-                }
-            else:
-                self.logger.info("Using current session credentials")
-                session_credentials = session.get_credentials()
 
-                utc_exp = datetime.utcnow() + timedelta(seconds=self.session_ttl)
-                utc_exp = utc_exp.replace(tzinfo=tz.UTC)
+class ETLException(Exception):
+    """Base exception class for ETL operations."""
+    
+    def __init__(self, message: str, operation: str, context: dict = None):
+        self.operation = operation
+        self.context = context or {}
+        super().__init__(message)
 
-                credentials = {
-                    "access_key": session_credentials.access_key,
-                    "secret_key": session_credentials.secret_key,
-                    "token": session_credentials.token,
-                    "expiry_time": utc_exp.astimezone(tz.tzlocal()).isoformat(),
-                }
-            
-            return credentials
-            
-        except Exception as e:
-            self.logger.log_error_with_context(e, "get_session_credentials")
-            raise
 
-    def refreshable_session(self) -> Session:
-        """Create a refreshable boto3 session with automatic credential refresh."""
-        try:
-            self.logger.info("Creating refreshable session")
-            refreshable_credentials = RefreshableCredentials.create_from_metadata(
-                metadata=self.__get_session_credentials(),
-                refresh_using=self.__get_session_credentials,
-                method="sts-assume-role",
-            )
-            session = get_session()
-            session._credentials = refreshable_credentials
-            session.set_config_variable("region", self.region_name)
-            autorefresh_session = Session(botocore_session=session)
+class DataValidationError(ETLException):
+    """Exception raised when data validation fails."""
+    pass
 
-            self.logger.info("Refreshable session created successfully")
-            return autorefresh_session
-            
-        except Exception as e:
-            self.logger.log_error_with_context(e, "refreshable_session")
-            raise
+
+class AWSServiceError(ETLException):
+    """Exception raised when AWS service operations fail."""
+    pass
+
+
+class DataProcessingError(ETLException):
+    """Exception raised during data processing operations."""
+    pass
