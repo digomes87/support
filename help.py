@@ -1,389 +1,362 @@
 """
-Validação de Dados e Funções Utilitárias
-
-Este módulo fornece funções utilitárias para conversão segura de tipos de dados,
-filtragem de partições e validação de dados para o processo ETL.
+Configuração de mapeamento de banco de dados para operações ETL.
+Centraliza todos os mapeamentos de tabelas de banco de dados, especificações de colunas e utilitários de consulta.
 """
 
-from typing import Any, Dict, List, Union
-
-from pyspark.sql.types import DecimalType, IntegerType, StringType
-
-# Mapeamentos de tipos de coluna para validação de dados
-COLUMN_TYPE = {
-    "cod_idef_pess": StringType(),
-    "CorrentistaAntigo": IntegerType(),
-    "Claro_Nao": IntegerType(),
-    "Cod_visao_Cliente": IntegerType(),
-    "Modalidade_Operacao": IntegerType(),
-    "Parcela_Mercado": DecimalType(10, 2),
-    "tipoInstituicao": StringType(),
-    "Situacao_BX": IntegerType(),
-    "Apontamento_BX": StringType(),
-    "Idade": StringType(),
-    "Indicador_SPO": StringType(),
-    "Cross_Consignado": IntegerType(),
-    "Gene_Emprego": IntegerType(),
-    "Target": IntegerType(),
-    "Codigo_Exclusao_Comercial": StringType(),
-    "Vinculo": StringType(),
-    "Cargos": StringType(),
-    "Renda_Sispag": DecimalType(15, 2),
-    "Valor_Contratado_Interno": DecimalType(15, 2),
-    "Numero_Conveio": StringType(),
-    "pct_maxi_cpmm_rend": DecimalType(5, 2),
-    "qtpzmax": IntegerType(),
-    "Parcela_Elegivel_Refin": DecimalType(15, 2),
-    "Indicador_SPI": StringType()
-}
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 
-def safe_numeric_cast(column_name: str, target_type: str, alias: str) -> str:
-    """
-    Gera expressão SQL de conversão numérica segura.
-    
-    Args:
-        column_name: Nome da coluna a ser convertida
-        target_type: Tipo de dados de destino (STRING, INT, DECIMAL, etc.)
-        alias: Alias para a coluna resultante
-    
-    Returns:
-        Expressão SQL CAST com tratamento de nulos
-    """
-    return f"CASE WHEN {column_name} IS NULL THEN CAST(-1 AS {target_type}) ELSE CAST({column_name} AS {target_type}) END AS {alias}"
+@dataclass
+class TableMapping:
+    """Configuração para mapeamento de tabela de banco de dados."""
+    database: str
+    table: str
+    column_mapping: Dict[str, str]
+    conditions: Optional[List[str]] = None
 
 
-def safe_numeric_where_condition(column_name: str, exclude_value: Union[int, float]) -> str:
-    """
-    Gera condição WHERE segura para colunas numéricas.
-    
-    Args:
-        column_name: Nome da coluna
-        exclude_value: Valor a ser excluído dos resultados
-    
-    Returns:
-        Condição SQL WHERE com tratamento de nulos
-    """
-    return f"({column_name} IS NULL OR {column_name} != {exclude_value})"
-
-
-def get_partition_filter(database_name: str, table_name: str, glue_client) -> str:
-    """
-    Obtém filtro de partição para a partição mais recente de uma tabela.
-    
-    Args:
-        database_name: Nome do banco de dados
-        table_name: Nome da tabela
-        glue_client: Instância do cliente AWS Glue
-    
-    Returns:
-        String de filtro de partição para a partição mais recente
-    """
-    try:
-        # Obtém partições da tabela do catálogo Glue
-        response = glue_client.get_partitions(
-            DatabaseName=database_name,
-            TableName=table_name,
-            MaxResults=1000
-        )
-        
-        partitions = response.get('Partitions', [])
-        
-        if not partitions:
-            return ""
-        
-        # Encontra a partição mais recente baseada nos valores de partição
-        latest_partition = max(partitions, key=lambda p: p.get('Values', []))
-        partition_keys = latest_partition.get('StorageDescriptor', {}).get('Columns', [])
-        partition_values = latest_partition.get('Values', [])
-        
-        if not partition_keys or not partition_values:
-            return ""
-        
-        # Constrói filtro de partição
-        filter_conditions = []
-        for i, key_info in enumerate(partition_keys):
-            if i < len(partition_values):
-                key_name = key_info.get('Name', '')
-                key_value = partition_values[i]
-                filter_conditions.append(f"{key_name} = '{key_value}'")
-        
-        return " AND ".join(filter_conditions)
-        
-    except Exception as e:
-        # Retorna string vazia se a filtragem de partição falhar
-        return ""
-
-
-class JSONSchemaValidator:
-    """
-    Validador de Schema JSON para validação do formato de saída ETL.
-    """
+class DatabaseMappingConfig:
+    """Configuração central para todos os mapeamentos e consultas de banco de dados."""
     
     def __init__(self):
-        """Inicializa o validador com o schema esperado"""
-        self.expected_schema = {
-            "type": "object",
-            "required": ["payloadIdentification", "payloadInput", "payloadAudit"],
-            "properties": {
-                "payloadIdentification": {
-                    "type": "object",
-                    "required": [
-                        "nom_fncd_serv_nego", "cod_idef_prpt_sist_prod", 
-                        "cod_idef_tran_sist_cred", "cod_idef_job_jorn",
-                        "cod_idef_tran_sist_prod", "cod_idef_prso_nego",
-                        "cod_idef_pess", "cod_tipo_pess"
-                    ],
-                    "properties": {
-                        "nom_fncd_serv_nego": {"type": "string"},
-                        "cod_idef_prpt_sist_prod": {"type": "string"},
-                        "cod_idef_tran_sist_cred": {"type": "string"},
-                        "cod_idef_job_jorn": {"type": "string"},
-                        "cod_idef_tran_sist_prod": {"type": "string"},
-                        "cod_idef_prso_nego": {"type": "string"},
-                        "cod_idef_pess": {"type": "string"},
-                        "nom_prso_sist_cred": {"type": "string"},
-                        "cod_stat_decs": {"type": "string"},
-                        "nom_tipo_decs_prpt": {"type": "string"},
-                        "nom_moto_anal_prpt": {"type": "string"},
-                        "cod_tipo_pess": {"type": "string"},
-                        "nom_prod_cred": {"type": "string"},
-                        "nom_fase_cred": {"type": "string"},
-                        "nom_pilo_pltc_cred": {"type": "string"},
-                        "cod_vers_pltc": {"type": "string"},
-                        "cod_vers_tecn_pltc": {"type": "string"},
-                        "dat_hor_exeo_descs": {"type": "string"}
-                    }
+        """Inicializa mapeamentos e configurações de banco de dados."""
+        self.table_mappings = {
+            # Informações de colaboração de convênio
+            "conv_cola_info": TableMapping(
+                database="db_corp_servicosdecontratacao_consignado_sor_01",
+                table="tbazcma",
+                column_mapping={
+                    "nrmaer": "nrmaer",
+                    "cdgrcons": "cdgrcons", 
+                    "tpempseg": "tpempseg",
+                    "cdagecdt": "cdagecdt",
+                    "cdctacdt": "cdctacdt"
                 },
-                "payloadInput": {
-                    "type": "object",
-                    "required": ["tipoProcesso", "solicitacao", "proponente"],
-                    "properties": {
-                        "tipoProcesso": {"type": "string"},
-                        "solicitacao": {
-                            "type": "object",
-                            "properties": {
-                                "codCanal": {"type": "integer"},
-                                "codsubCanal": {"type": "integer"},
-                                "numeroConvenio": {"type": "string"}
-                            }
-                        },
-                        "dadosOferta": {
-                            "type": "object",
-                            "properties": {
-                                "flagInelebilidadeForte": {"type": "integer"}
-                            }
-                        },
-                        "listaValoresCalculados": {
-                            "type": "object",
-                            "properties": {
-                                "percentual": {"type": "number"},
-                                "prazo": {"type": "integer"},
-                                "vlrParcelaElegivel": {"type": "number"}
-                            }
-                        },
-                        "proponente": {
-                            "type": "object",
-                            "required": ["numeroDocumento"],
-                            "properties": {
-                                "numeroDocumento": {"type": "string"},
-                                "listaContratos": {"type": "array"},
-                                "dadosEndividamento": {
-                                    "type": "object",
-                                    "properties": {
-                                        "valorParcConsignado": {"type": "number"},
-                                        "valorParcConsignadoItau": {"type": "number"}
-                                    }
-                                },
-                                "dadosFatorRisco": {
-                                    "type": "object",
-                                    "properties": {
-                                        "listaExclusao": {"type": "array"},
-                                        "listaApontamentos": {"type": "array"},
-                                        "geneEmprego": {"type": "integer"}
-                                    }
-                                },
-                                "indCorrentistaAntigo": {
-                                    "type": "object",
-                                    "properties": {
-                                        "indCorrentistaAntigo": {"type": "integer"}
-                                    }
-                                },
-                                "dadosBacen": {
-                                    "type": "object",
-                                    "properties": {
-                                        "codSubModalidadeOperacao": {"type": "integer"},
-                                        "tipoInstituicao": {"type": "string"}
-                                    }
-                                },
-                                "dadosPessoaFisica": {
-                                    "type": "object",
-                                    "properties": {
-                                        "idadeCliente": {"type": "string"},
-                                        "spiVisaoConta": {"type": "string"},
-                                        "spoVisaoConta": {"type": "string"},
-                                        "listaVinculos": {"type": "array"},
-                                        "listaCargos": {"type": "array"}
-                                    }
-                                },
-                                "dadosVisaoCliente": {
-                                    "type": "object",
-                                    "properties": {
-                                        "rating": {"type": "integer"}
-                                    }
-                                },
-                                "dadosModelos": {
-                                    "type": "object",
-                                    "properties": {
-                                        "crossConsignado": {"type": "integer"},
-                                        "visaoCliente": {"type": "integer"},
-                                        "geneEmprego": {"type": "integer"}
-                                    }
-                                },
-                                "dadosRenda": {
-                                    "type": "object",
-                                    "properties": {
-                                        "rendaInternaCliente": {"type": "number"}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                "payloadAudit": {
-                    "type": "object",
-                    "required": ["auditSteps", "calculatedVars", "isAuditEnabled", "isCalculatedVarsEnabled"],
-                    "properties": {
-                        "auditSteps": {"type": "array"},
-                        "calculatedVars": {"type": "array"},
-                        "isAuditEnabled": {"type": "boolean"},
-                        "isCalculatedVarsEnabled": {"type": "boolean"}
-                    }
+                conditions=["tpempseg = 2", "cdgrcons != 'INSS'"]
+            ),
+            
+            # Informações de contrato de funcionário
+            "employee_contract_info": TableMapping(
+                database="db_corp_servicosdecontratacao_consignado_sor_01",
+                table="tbazctc",
+                column_mapping={
+                    "nrmaer": "nrmaer",
+                    "vlrenda": "vlrenda",
+                    "pct_maxi_cpmm_rend": "pct_maxi_cpmm_rend",
+                    "qtpzmax": "qtpzmax",
+                    "vlrparcelaelegivelrefinanciamento": "vlrparcelaelegivelrefinanciamento"
                 }
-            }
+            ),
+            
+            # Visão de crédito do cliente
+            "customer_credit_view": TableMapping(
+                database="ricdb",
+                table="tbfc6034_vsao_cred_clie",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "Ind_clie_corn_anti": "Ind_clie_corn_anti",
+                    "cod_grup_vsao_clie": "cod_grup_vsao_clie",
+                    "cod_crgo_clie": "cod_crgo_clie",
+                    "cod_vncl_orgo_pubi": "cod_vncl_orgo_pubi"
+                }
+            ),
+            
+            # Cliente de visão de crédito
+            "vsao_cred_clie": TableMapping(
+                database="ricdb",
+                table="tbfc6034_vsao_cred_clie",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "Ind_clie_corn_anti": "Ind_clie_corn_anti",
+                    "cod_grup_vsao_clie": "cod_grup_vsao_clie",
+                    "cod_crgo_clie": "cod_crgo_clie",
+                    "cod_vncl_orgo_pubi": "cod_vncl_orgo_pubi"
+                }
+            ),
+            
+            # Dados manuais - grupo de visão do cliente
+            "grup_vsao_clie_dm": TableMapping(
+                database="dados_manuais",
+                table="tbfc6418_grup_vsao_clie_dm",
+                column_mapping={}
+            ),
+            
+            # Modo de elemento de pessoa física
+            "mode_elto_pfis": TableMapping(
+                database="dados_manuais",
+                table="tbfc6419_mode_elto_pfis",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "cod_mode_elto_pfis": "cod_mode_elto_pfis"
+                }
+            ),
+            
+            # Crédito de cliente pessoa física
+            "cred_clie_pfis": TableMapping(
+                database="dados_manuais",
+                table="tbfc6420_cred_clie_pfis",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "cod_cred_clie_pfis": "cod_cred_clie_pfis"
+                }
+            ),
+            
+            # Pagamento de salário SPI
+            "pgto_salr_spi": TableMapping(
+                database="dados_manuais",
+                table="tbfc6421_pgto_salr_spi",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "cod_pgto_salr_spi": "cod_pgto_salr_spi"
+                }
+            ),
+            
+            # Transferência de conta salário
+            "trsf_cont_salr": TableMapping(
+                database="dados_manuais",
+                table="tbfc6422_trsf_cont_salr",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "cod_trsf_cont_salr": "cod_trsf_cont_salr"
+                }
+            ),
+            
+            # Base de dados de modo de classificação Bradesco
+            "dtbc_mode_claf_brau": TableMapping(
+                database="dados_manuais",
+                table="tbfc6430_dtbc_mode_claf_brau",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "cod_dtbc_mode_claf_brau": "cod_dtbc_mode_claf_brau"
+                }
+            ),
+            
+            # Dados manuais - modo cruzado consignado
+            "mode_csgd_crss_dm": TableMapping(
+                database="dados_manuais",
+                table="tbfc6431_mode_csgd_crss_dm",
+                column_mapping={
+                    "ind_rati_csgd": "ind_rati_csgd"
+                }
+            ),
+            
+            # Dados manuais - cargo do cliente
+            "crgo_clie_dm": TableMapping(
+                database="dados_manuais",
+                table="tbfc6671_crgo_clie_dm",
+                column_mapping={
+                    "nom_crgo": "nom_crgo",
+                    "nom_vncl": "nom_vncl"
+                }
+            ),
+            
+            # Dados manuais - vínculo órgão público
+            "vncl_orgo_pubi_dm": TableMapping(
+                database="dados_manuais",
+                table="tbfc6432_vncl_orgo_pubi_dm",
+                column_mapping={
+                    "num_ctrt_mae_lgdo": "cod_iden_conv_cred_csgd"
+                }
+            ),
+            
+            # Risco de crédito consignado
+            "risc_cred_csgb": TableMapping(
+                database="dados_manuais",
+                table="tbfc6433_risc_cred_csgb",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "cod_risc_cred_csgb": "cod_risc_cred_csgb"
+                }
+            ),
+            
+            # Contrato de crédito consignado
+            "ctrt_cred_csgd": TableMapping(
+                database="ricdb",
+                table="tbfc6035_ctrt_cred_csgd",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "num_ctrt_cred_csgd": "num_ctrt_cred_csgd",
+                    "vlr_ctrt_cred_csgd": "vlr_ctrt_cred_csgd",
+                    "vlr_parc_cred_csgd": "vlr_parc_cred_csgd",
+                    "qtd_parc_cred_csgd": "qtd_parc_cred_csgd",
+                    "dat_venc_prim_parc": "dat_venc_prim_parc",
+                    "dat_venc_ulti_parc": "dat_venc_ulti_parc",
+                    "cod_iden_conv_cred_csgd": "cod_iden_conv_cred_csgd",
+                    "cod_tipo_oper_cred": "cod_tipo_oper_cred",
+                    "cod_situ_ctrt_cred": "cod_situ_ctrt_cred"
+                }
+            ),
+            
+            # Elemento de renda de pessoa física
+            "rend_elto_pfis": TableMapping(
+                database="ricdb",
+                table="tbfc6036_rend_elto_pfis",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "vlr_rend_brut_mens": "vlr_rend_brut_mens",
+                    "vlr_rend_liqu_mens": "vlr_rend_liqu_mens",
+                    "cod_mode_elto_pfis": "cod_mode_elto_pfis",
+                    "dat_admi_empr": "dat_admi_empr",
+                    "dat_nasc": "dat_nasc"
+                }
+            ),
+            
+            # Contrato ativo
+            "active_contract": TableMapping(
+                database="ricdb",
+                table="tbfc6037_cont_ativ",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "cod_tipo_cont": "cod_tipo_cont",
+                    "cod_cont_ativ": "cod_cont_ativ"
+                },
+                conditions=["cod_tipo_cont = 'C'", "cod_cont_ativ = 1"]
+            ),
+            
+            # Classificação de emprego
+            "employment_classification": TableMapping(
+                database="ricdb",
+                table="tbfc6512_claf_empr",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "cod_claf_empr": "cod_claf_empr"
+                }
+            ),
+            
+            # Posição do cliente
+            "customer_position": TableMapping(
+                database="ricdb",
+                table="tbfc6513_posi_clie",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "cod_posi_clie": "cod_posi_clie"
+                }
+            ),
+            
+            # Risco de crédito atribuído
+            "credit_risk_assigned": TableMapping(
+                database="ricdb",
+                table="tbfc6514_risc_cred_atri",
+                column_mapping={
+                    "cod_idef_pess": "cod_idef_pess",
+                    "cod_risc_cred_atri": "cod_risc_cred_atri"
+                }
+            )
+        }
+        
+        # Mapeamentos de chaves de junção para operações comuns
+        self.join_keys = {
+            "person_id": "cod_idef_pess",
+            "convenio_id": "nrmaer",
+            "contract_id": "cod_ctrt"
+        }
+        
+        # Aliases de banco de dados para referência mais fácil
+        self.database_aliases = {
+            "ricdb": "ricdb",
+            "consignado": "db_corp_servicosdecontratacao_consignado_sor_01",
+            "keyspace": "keyspace_db",
+            "dados_manuais": "dados_manuais"
         }
     
-    def validate_structure(self, data: Dict[str, Any]) -> tuple[bool, List[str]]:
-        """
-        Valida estrutura de dados contra o schema esperado.
-        
-        Args:
-            data: Dicionário de dados para validar
-        
-        Returns:
-            Tupla de (é_válido, mensagens_de_erro)
-        """
-        errors = []
-        
-        try:
-            # Validação básica de estrutura
-            if not isinstance(data, dict):
-                errors.append("Dados devem ser um dicionário")
-                return False, errors
-            
-            # Verifica campos obrigatórios de nível superior
-            required_fields = ["payloadIdentification", "payloadInput", "payloadAudit"]
-            for field in required_fields:
-                if field not in data:
-                    errors.append(f"Campo obrigatório ausente: {field}")
-            
-            # Valida payloadIdentification
-            if "payloadIdentification" in data:
-                payload_id = data["payloadIdentification"]
-                if not isinstance(payload_id, dict):
-                    errors.append("payloadIdentification deve ser um dicionário")
-                else:
-                    required_id_fields = [
-                        "nom_fncd_serv_nego", "cod_idef_prpt_sist_prod",
-                        "cod_idef_tran_sist_cred", "cod_idef_pess"
-                    ]
-                    for field in required_id_fields:
-                        if field not in payload_id:
-                            errors.append(f"Campo obrigatório ausente em payloadIdentification: {field}")
-            
-            # Valida payloadInput
-            if "payloadInput" in data:
-                payload_input = data["payloadInput"]
-                if not isinstance(payload_input, dict):
-                    errors.append("payloadInput deve ser um dicionário")
-                else:
-                    if "proponente" not in payload_input:
-                        errors.append("Campo obrigatório ausente em payloadInput: proponente")
-                    elif "numeroDocumento" not in payload_input["proponente"]:
-                        errors.append("Campo obrigatório ausente em proponente: numeroDocumento")
-            
-            # Valida payloadAudit
-            if "payloadAudit" in data:
-                payload_audit = data["payloadAudit"]
-                if not isinstance(payload_audit, dict):
-                    errors.append("payloadAudit deve ser um dicionário")
-                else:
-                    required_audit_fields = ["auditSteps", "calculatedVars", "isAuditEnabled", "isCalculatedVarsEnabled"]
-                    for field in required_audit_fields:
-                        if field not in payload_audit:
-                            errors.append(f"Campo obrigatório ausente em payloadAudit: {field}")
-            
-            return len(errors) == 0, errors
-            
-        except Exception as e:
-            errors.append(f"Erro de validação: {str(e)}")
-            return False, errors
+    def get_table_mapping(self, table_key: str) -> Optional[TableMapping]:
+        """Obtém configuração de mapeamento de tabela por chave"""
+        return self.table_mappings.get(table_key)
+    
+    def get_database_alias(self, alias: str) -> Optional[str]:
+        """Obtém nome do banco de dados por alias"""
+        return self.database_aliases.get(alias)
+    
+    def get_join_key(self, key_type: str) -> Optional[str]:
+        """Obtém chave de junção por tipo"""
+        return self.join_keys.get(key_type)
 
 
-def validate_etl_output_format(data: Dict[str, Any]) -> tuple[bool, List[str]]:
+def get_mapped_query_parts(
+    table_key: str, 
+    select_fields: List[str], 
+    where_conditions: Optional[List[str]] = None
+) -> Tuple[str, str, str]:
     """
-    Valida formato de saída ETL usando JSONSchemaValidator.
+    Obtém partes da consulta (SELECT, FROM, WHERE) para uma tabela mapeada.
     
     Args:
-        data: Dicionário de dados para validar
-    
+        table_key: Chave para mapeamento de tabela
+        select_fields: Lista de campos para selecionar
+        where_conditions: Condições WHERE opcionais
+        
     Returns:
-        Tupla de (é_válido, mensagens_de_erro)
+        Tupla de (cláusula SELECT, cláusula FROM, cláusula WHERE)
     """
-    validator = JSONSchemaValidator()
-    return validator.validate_structure(data)
+    db_config = DatabaseMappingConfig()
+    mapping = db_config.get_table_mapping(table_key)
+    
+    if not mapping:
+        raise ValueError(f"Mapeamento de tabela não encontrado para a chave: {table_key}")
+    
+    # Constrói cláusula SELECT
+    if select_fields == ["*"]:
+        select_clause = "SELECT *"
+    else:
+        # Mapeia nomes de campos se o mapeamento de colunas existir
+        mapped_fields = []
+        for field in select_fields:
+            mapped_field = mapping.column_mapping.get(field, field)
+            mapped_fields.append(mapped_field)
+        select_clause = f"SELECT {', '.join(mapped_fields)}"
+    
+    # Constrói cláusula FROM
+    from_clause = f"FROM {mapping.database}.{mapping.table}"
+    
+    # Constrói cláusula WHERE
+    where_parts = []
+    if mapping.conditions:
+        where_parts.extend(mapping.conditions)
+    if where_conditions:
+        where_parts.extend(where_conditions)
+    
+    where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    
+    return select_clause, from_clause, where_clause
 
 
-def validate_dataframe_columns(df, required_columns: List[str], logger=None) -> bool:
+def build_standardized_query(
+    table_key: str,
+    select_fields: List[str],
+    where_conditions: Optional[List[str]] = None,
+    partition_filter: Optional[str] = None
+) -> str:
     """
-    Valida se o DataFrame contém todas as colunas obrigatórias.
+    Constrói uma consulta SQL padronizada para uma tabela mapeada.
     
     Args:
-        df: DataFrame Spark para validar
-        required_columns: Lista de nomes de colunas obrigatórias
-        logger: Instância opcional de logger
-    
+        table_key: Chave para mapeamento de tabela
+        select_fields: Lista de campos para selecionar
+        where_conditions: Condições WHERE opcionais
+        partition_filter: Filtro de partição opcional
+        
     Returns:
-        True se todas as colunas obrigatórias estiverem presentes, False caso contrário
+        String de consulta SQL completa
     """
-    if df is None:
-        if logger:
-            logger.error("DataFrame é None")
-        return False
+    select_clause, from_clause, where_clause = get_mapped_query_parts(
+        table_key, select_fields, where_conditions
+    )
     
-    missing_columns = [col for col in required_columns if col not in df.columns]
+    # Adiciona filtro de partição se fornecido
+    if partition_filter:
+        if where_clause:
+            where_clause += f" AND {partition_filter}"
+        else:
+            where_clause = f"WHERE {partition_filter}"
     
-    if missing_columns:
-        if logger:
-            logger.error(f"Colunas obrigatórias ausentes: {missing_columns}")
-        return False
+    # Combina todas as partes
+    query_parts = [select_clause, from_clause]
+    if where_clause:
+        query_parts.append(where_clause)
     
-    return True
+    return " ".join(query_parts)
 
 
-def log_dataframe_info(df, table_name: str, logger=None):
-    """
-    Registra informações básicas sobre um DataFrame.
-    
-    Args:
-        df: DataFrame Spark
-        table_name: Nome da tabela/fonte
-        logger: Instância opcional de logger
-    """
-    if logger and df is not None:
-        try:
-            row_count = df.count()
-            column_count = len(df.columns)
-            logger.info(f"Tabela {table_name}: {row_count} linhas, {column_count} colunas")
-        except Exception as e:
-            logger.warning(f"Não foi possível obter informações para a tabela {table_name}: {str(e)}")
+# Instância global para acesso fácil
+db_mapping = DatabaseMappingConfig()
