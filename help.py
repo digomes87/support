@@ -1,362 +1,380 @@
 """
-Database mapping configuration for ETL operations.
-Centralizes all database table mappings, column specifications, and query utilities.
+Database query functions for data preparation
+Based on atividade.md specifications
 """
 
-from dataclasses import dataclass
+from logging import Logger
 from typing import Dict, List, Optional, Tuple
 
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, lit, when
 
-@dataclass
-class TableMapping:
-    """Configuration for database table mapping."""
-    database: str
-    table: str
-    column_mapping: Dict[str, str]
-    conditions: Optional[List[str]] = None
+from .database_mapping import DatabaseMappingConfig, build_standardized_query
+from .data_validation import get_partition_filter, validate_dataframe_columns, log_dataframe_info
 
 
-class DatabaseMappingConfig:
-    """Central configuration for all database mappings and queries."""
-    
-    def __init__(self):
-        """Initialize database mappings and configurations."""
-        self.table_mappings = {
-            # Convenio collaboration info
-            "conv_cola_info": TableMapping(
-                database="db_corp_servicosdecontratacao_consignado_sor_01",
-                table="tbazcma",
-                column_mapping={
-                    "nrmaer": "nrmaer",
-                    "cdgrcons": "cdgrcons", 
-                    "tpempseg": "tpempseg",
-                    "cdagecdt": "cdagecdt",
-                    "cdctacdt": "cdctacdt"
-                },
-                conditions=["tpempseg = 2", "cdgrcons != 'INSS'"]
-            ),
-            
-            # Employee contract info
-            "employee_contract_info": TableMapping(
-                database="db_corp_servicosdecontratacao_consignado_sor_01",
-                table="tbazctc",
-                column_mapping={
-                    "nrmaer": "nrmaer",
-                    "vlrenda": "vlrenda",
-                    "pct_maxi_cpmm_rend": "pct_maxi_cpmm_rend",
-                    "qtpzmax": "qtpzmax",
-                    "vlrparcelaelegivelrefinanciamento": "vlrparcelaelegivelrefinanciamento"
-                }
-            ),
-            
-            # Customer credit view
-            "customer_credit_view": TableMapping(
-                database="ricdb",
-                table="tbfc6034_vsao_cred_clie",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "Ind_clie_corn_anti": "Ind_clie_corn_anti",
-                    "cod_grup_vsao_clie": "cod_grup_vsao_clie",
-                    "cod_crgo_clie": "cod_crgo_clie",
-                    "cod_vncl_orgo_pubi": "cod_vncl_orgo_pubi"
-                }
-            ),
-            
-            # Credit view client
-            "vsao_cred_clie": TableMapping(
-                database="ricdb",
-                table="tbfc6034_vsao_cred_clie",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "Ind_clie_corn_anti": "Ind_clie_corn_anti",
-                    "cod_grup_vsao_clie": "cod_grup_vsao_clie",
-                    "cod_crgo_clie": "cod_crgo_clie",
-                    "cod_vncl_orgo_pubi": "cod_vncl_orgo_pubi"
-                }
-            ),
-            
-            # Manual data - client vision group
-            "grup_vsao_clie_dm": TableMapping(
-                database="dados_manuais",
-                table="tbfc6418_grup_vsao_clie_dm",
-                column_mapping={}
-            ),
-            
-            # Physical person element mode
-            "mode_elto_pfis": TableMapping(
-                database="dados_manuais",
-                table="tbfc6419_mode_elto_pfis",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "cod_mode_elto_pfis": "cod_mode_elto_pfis"
-                }
-            ),
-            
-            # Physical person credit
-            "cred_clie_pfis": TableMapping(
-                database="dados_manuais",
-                table="tbfc6420_cred_clie_pfis",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "cod_cred_clie_pfis": "cod_cred_clie_pfis"
-                }
-            ),
-            
-            # SPI salary payment
-            "pgto_salr_spi": TableMapping(
-                database="dados_manuais",
-                table="tbfc6421_pgto_salr_spi",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "cod_pgto_salr_spi": "cod_pgto_salr_spi"
-                }
-            ),
-            
-            # Salary account transfer
-            "trsf_cont_salr": TableMapping(
-                database="dados_manuais",
-                table="tbfc6422_trsf_cont_salr",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "cod_trsf_cont_salr": "cod_trsf_cont_salr"
-                }
-            ),
-            
-            # Bradesco classification mode database
-            "dtbc_mode_claf_brau": TableMapping(
-                database="dados_manuais",
-                table="tbfc6430_dtbc_mode_claf_brau",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "cod_dtbc_mode_claf_brau": "cod_dtbc_mode_claf_brau"
-                }
-            ),
-            
-            # Manual data - consignado cross mode
-            "mode_csgd_crss_dm": TableMapping(
-                database="dados_manuais",
-                table="tbfc6431_mode_csgd_crss_dm",
-                column_mapping={
-                    "ind_rati_csgd": "ind_rati_csgd"
-                }
-            ),
-            
-            # Manual data - client position
-            "crgo_clie_dm": TableMapping(
-                database="dados_manuais",
-                table="tbfc6671_crgo_clie_dm",
-                column_mapping={
-                    "nom_crgo": "nom_crgo",
-                    "nom_vncl": "nom_vncl"
-                }
-            ),
-            
-            # Manual data - public organ link
-            "vncl_orgo_pubi_dm": TableMapping(
-                database="dados_manuais",
-                table="tbfc6432_vncl_orgo_pubi_dm",
-                column_mapping={
-                    "num_ctrt_mae_lgdo": "cod_iden_conv_cred_csgd"
-                }
-            ),
-            
-            # Consignado credit risk
-            "risc_cred_csgb": TableMapping(
-                database="dados_manuais",
-                table="tbfc6433_risc_cred_csgb",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "cod_risc_cred_csgb": "cod_risc_cred_csgb"
-                }
-            ),
-            
-            # Consignado credit contract
-            "ctrt_cred_csgd": TableMapping(
-                database="ricdb",
-                table="tbfc6035_ctrt_cred_csgd",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "num_ctrt_cred_csgd": "num_ctrt_cred_csgd",
-                    "vlr_ctrt_cred_csgd": "vlr_ctrt_cred_csgd",
-                    "vlr_parc_cred_csgd": "vlr_parc_cred_csgd",
-                    "qtd_parc_cred_csgd": "qtd_parc_cred_csgd",
-                    "dat_venc_prim_parc": "dat_venc_prim_parc",
-                    "dat_venc_ulti_parc": "dat_venc_ulti_parc",
-                    "cod_iden_conv_cred_csgd": "cod_iden_conv_cred_csgd",
-                    "cod_tipo_oper_cred": "cod_tipo_oper_cred",
-                    "cod_situ_ctrt_cred": "cod_situ_ctrt_cred"
-                }
-            ),
-            
-            # Physical person income element
-            "rend_elto_pfis": TableMapping(
-                database="ricdb",
-                table="tbfc6036_rend_elto_pfis",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "vlr_rend_brut_mens": "vlr_rend_brut_mens",
-                    "vlr_rend_liqu_mens": "vlr_rend_liqu_mens",
-                    "cod_mode_elto_pfis": "cod_mode_elto_pfis",
-                    "dat_admi_empr": "dat_admi_empr",
-                    "dat_nasc": "dat_nasc"
-                }
-            ),
-            
-            # Active contract
-            "active_contract": TableMapping(
-                database="ricdb",
-                table="tbfc6037_cont_ativ",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "cod_tipo_cont": "cod_tipo_cont",
-                    "cod_cont_ativ": "cod_cont_ativ"
-                },
-                conditions=["cod_tipo_cont = 'C'", "cod_cont_ativ = 1"]
-            ),
-            
-            # Employment classification
-            "employment_classification": TableMapping(
-                database="ricdb",
-                table="tbfc6512_claf_empr",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "cod_claf_empr": "cod_claf_empr"
-                }
-            ),
-            
-            # Customer position
-            "customer_position": TableMapping(
-                database="ricdb",
-                table="tbfc6513_posi_clie",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "cod_posi_clie": "cod_posi_clie"
-                }
-            ),
-            
-            # Credit risk assigned
-            "credit_risk_assigned": TableMapping(
-                database="ricdb",
-                table="tbfc6514_risc_cred_atri",
-                column_mapping={
-                    "cod_idef_pess": "cod_idef_pess",
-                    "cod_risc_cred_atri": "cod_risc_cred_atri"
-                }
-            )
-        }
-        
-        # Join key mappings for common operations
-        self.join_keys = {
-            "person_id": "cod_idef_pess",
-            "convenio_id": "nrmaer",
-            "contract_id": "cod_ctrt"
-        }
-        
-        # Database aliases for easier reference
-        self.database_aliases = {
-            "ricdb": "ricdb",
-            "consignado": "db_corp_servicosdecontratacao_consignado_sor_01",
-            "keyspace": "keyspace_db",
-            "dados_manuais": "dados_manuais"
-        }
-    
-    def get_table_mapping(self, table_key: str) -> Optional[TableMapping]:
-        """Get table mapping configuration by key"""
-        return self.table_mappings.get(table_key)
-    
-    def get_database_alias(self, alias: str) -> Optional[str]:
-        """Get database name by alias"""
-        return self.database_aliases.get(alias)
-    
-    def get_join_key(self, key_type: str) -> Optional[str]:
-        """Get join key by type"""
-        return self.join_keys.get(key_type)
-
-
-def get_mapped_query_parts(
-    table_key: str, 
-    select_fields: List[str], 
-    where_conditions: Optional[List[str]] = None
-) -> Tuple[str, str, str]:
+def consulta_tabelas_main(
+    spark: SparkSession,
+    lista_cpf: List[str],
+    data_referencia: str,
+    logger: Logger
+) -> DataFrame:
     """
-    Get query parts (SELECT, FROM, WHERE) for a mapped table.
-    
-    Args:
-        table_key: Key for table mapping
-        select_fields: List of fields to select
-        where_conditions: Optional WHERE conditions
-        
-    Returns:
-        Tuple of (SELECT clause, FROM clause, WHERE clause)
+    Main function to query all tables and combine results
     """
+    logger.info("Starting main table queries")
+    
+    # Initialize database mapping configuration
     db_config = DatabaseMappingConfig()
-    mapping = db_config.get_table_mapping(table_key)
     
-    if not mapping:
-        raise ValueError(f"Table mapping not found for key: {table_key}")
+    # Get keyspace queries
+    df_keyspace = get_consultas_keyspace(spark, lista_cpf, data_referencia, logger)
     
-    # Build SELECT clause
-    if select_fields == ["*"]:
-        select_clause = "SELECT *"
+    # Get Aurora queries
+    df_aurora = get_consulta_aurora(spark, lista_cpf, data_referencia, logger)
+    
+    # Combine results
+    resultado_df = df_keyspace.union(df_aurora)
+    
+    logger.info(f"Combined query result count: {resultado_df.count()}")
+    return resultado_df
+
+
+def get_consultas_keyspace(
+    spark: SparkSession,
+    lista_cpf: List[str],
+    data_referencia: str,
+    logger: Logger
+) -> DataFrame:
+    """
+    Execute queries for Keyspace tables
+    """
+    logger.info("Executing Keyspace queries")
+    
+    db_config = DatabaseMappingConfig()
+    keyspace_tables = [
+        "conv_cola_info",
+        "employee_contract_info", 
+        "customer_credit_view",
+        "vsao_cred_clie",
+        "ctrt_cred_csgd",
+        "rend_elto_pfis",
+        "grup_vsao_clie_dm"
+    ]
+    
+    dataframes = []
+    
+    for table_name in keyspace_tables:
+        try:
+            df = consulta_tabelas_mapped(
+                spark, table_name, lista_cpf, data_referencia, logger
+            )
+            if df is not None:
+                dataframes.append(df)
+        except Exception as e:
+            logger.error(f"Error querying table {table_name}: {str(e)}")
+            continue
+    
+    if dataframes:
+        resultado_df = dataframes[0]
+        for df in dataframes[1:]:
+            resultado_df = resultado_df.union(df)
+        return resultado_df
     else:
-        # Map field names if column mapping exists
-        mapped_fields = []
-        for field in select_fields:
-            mapped_field = mapping.column_mapping.get(field, field)
-            mapped_fields.append(mapped_field)
-        select_clause = f"SELECT {', '.join(mapped_fields)}"
-    
-    # Build FROM clause
-    from_clause = f"FROM {mapping.database}.{mapping.table}"
-    
-    # Build WHERE clause
-    where_parts = []
-    if mapping.conditions:
-        where_parts.extend(mapping.conditions)
-    if where_conditions:
-        where_parts.extend(where_conditions)
-    
-    where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-    
-    return select_clause, from_clause, where_clause
+        # Return empty DataFrame with expected schema
+        return spark.createDataFrame([], schema="cod_idef_pess string")
 
 
-def build_standardized_query(
-    table_key: str,
-    select_fields: List[str],
-    where_conditions: Optional[List[str]] = None,
-    partition_filter: Optional[str] = None
-) -> str:
+def get_consulta_aurora(
+    spark: SparkSession,
+    lista_cpf: List[str],
+    data_referencia: str,
+    logger: Logger
+) -> DataFrame:
     """
-    Build a standardized SQL query for a mapped table.
+    Execute queries for Aurora tables
+    """
+    logger.info("Executing Aurora queries")
     
-    Args:
-        table_key: Key for table mapping
-        select_fields: List of fields to select
-        where_conditions: Optional WHERE conditions
-        partition_filter: Optional partition filter
+    aurora_tables = [
+        "mode_elto_pfis",
+        "cred_clie_pfis", 
+        "pgto_salr_spi",
+        "trsf_cont_salr",
+        "dtbc_mode_claf_brau",
+        "mode_csgd_crss_dm",
+        "crgo_clie_dm",
+        "vncl_orgo_pubi_dm",
+        "risc_cred_csgb"
+    ]
+    
+    dataframes = []
+    
+    for table_name in aurora_tables:
+        try:
+            df = consulta_tabelas_mapped(
+                spark, table_name, lista_cpf, data_referencia, logger
+            )
+            if df is not None:
+                dataframes.append(df)
+        except Exception as e:
+            logger.error(f"Error querying Aurora table {table_name}: {str(e)}")
+            continue
+    
+    if dataframes:
+        resultado_df = dataframes[0]
+        for df in dataframes[1:]:
+            resultado_df = resultado_df.union(df)
+        return resultado_df
+    else:
+        # Return empty DataFrame with expected schema
+        return spark.createDataFrame([], schema="cod_idef_pess string")
+
+
+def consulta_tabelas_mapped(
+    spark: SparkSession,
+    table_name: str,
+    lista_cpf: List[str],
+    data_referencia: str,
+    logger: Logger
+) -> Optional[DataFrame]:
+    """
+    Query tables using database mapping configuration
+    """
+    try:
+        db_config = DatabaseMappingConfig()
         
-    Returns:
-        Complete SQL query string
+        if table_name not in db_config.table_mappings:
+            logger.warning(f"Table {table_name} not found in mappings")
+            return None
+        
+        # Build standardized query
+        query = build_standardized_query(
+            table_name=table_name,
+            cpf_list=lista_cpf,
+            reference_date=data_referencia
+        )
+        
+        logger.info(f"Executing query for table {table_name}")
+        logger.debug(f"Query: {query}")
+        
+        # Execute query
+        df = spark.sql(query)
+        
+        # Validate and log DataFrame info
+        validate_dataframe_columns(df, logger)
+        log_dataframe_info(df, table_name, logger)
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error in consulta_tabelas_mapped for {table_name}: {str(e)}")
+        return None
+
+
+def consulta_tabelas_convenio(
+    spark: SparkSession,
+    lista_cpf: List[str],
+    data_referencia: str,
+    logger: Logger
+) -> DataFrame:
     """
-    select_clause, from_clause, where_clause = get_mapped_query_parts(
-        table_key, select_fields, where_conditions
-    )
+    Query convenio tables with specific logic
+    """
+    logger.info("Executing convenio queries")
     
-    # Add partition filter if provided
-    if partition_filter:
-        if where_clause:
-            where_clause += f" AND {partition_filter}"
-        else:
-            where_clause = f"WHERE {partition_filter}"
-    
-    # Combine all parts
-    query_parts = [select_clause, from_clause]
-    if where_clause:
-        query_parts.append(where_clause)
-    
-    return " ".join(query_parts)
+    try:
+        # Build convenio query
+        cpf_condition = "', '".join(lista_cpf)
+        
+        query = f"""
+        SELECT 
+            cod_idef_pess,
+            numero_convenio,
+            nome_convenio,
+            data_inicio_convenio,
+            data_fim_convenio
+        FROM events_convenio
+        WHERE cod_idef_pess IN ('{cpf_condition}')
+        AND data_referencia = '{data_referencia}'
+        """
+        
+        df = spark.sql(query)
+        log_dataframe_info(df, "events_convenio", logger)
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error in consulta_tabelas_convenio: {str(e)}")
+        return spark.createDataFrame([], schema="cod_idef_pess string")
 
 
-# Global instance for easy access
-db_mapping = DatabaseMappingConfig()
+def spark_sql_query(
+    spark: SparkSession,
+    query: str,
+    logger: Logger
+) -> Optional[DataFrame]:
+    """
+    Execute SQL query with error handling
+    """
+    try:
+        logger.debug(f"Executing SQL query: {query}")
+        df = spark.sql(query)
+        return df
+    except Exception as e:
+        logger.error(f"Error executing SQL query: {str(e)}")
+        return None
+
+
+def create_data_frame(
+    spark: SparkSession,
+    database: str,
+    table: str,
+    logger: Logger
+) -> Optional[DataFrame]:
+    """
+    Create DataFrame from Glue catalog
+    """
+    try:
+        full_table_name = f"{database}.{table}"
+        logger.info(f"Creating DataFrame for {full_table_name}")
+        
+        df = spark.table(full_table_name)
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error creating DataFrame for {database}.{table}: {str(e)}")
+        return None
+
+
+def add_missing_columns_with_nulls(
+    df: DataFrame,
+    expected_columns: List[str],
+    logger: Logger
+) -> DataFrame:
+    """
+    Add missing columns with null values
+    """
+    try:
+        existing_columns = df.columns
+        missing_columns = [col for col in expected_columns if col not in existing_columns]
+        
+        if missing_columns:
+            logger.info(f"Adding missing columns: {missing_columns}")
+            for col_name in missing_columns:
+                df = df.withColumn(col_name, lit(None))
+        
+        return df.select(*expected_columns)
+        
+    except Exception as e:
+        logger.error(f"Error adding missing columns: {str(e)}")
+        return df
+
+
+def get_publico_correntista(
+    spark: SparkSession,
+    lista_cpf: List[str],
+    data_referencia: str,
+    logger: Logger
+) -> DataFrame:
+    """
+    Get public account holder data
+    """
+    logger.info("Getting public account holder data")
+    
+    try:
+        cpf_condition = "', '".join(lista_cpf)
+        
+        query = f"""
+        SELECT 
+            cod_idef_pess,
+            indicador_publico,
+            data_inicio_conta,
+            data_ultima_movimentacao
+        FROM public_person_view
+        WHERE cod_idef_pess IN ('{cpf_condition}')
+        AND data_referencia = '{data_referencia}'
+        """
+        
+        df = spark.sql(query)
+        log_dataframe_info(df, "public_person_view", logger)
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error in get_publico_correntista: {str(e)}")
+        return spark.createDataFrame([], schema="cod_idef_pess string")
+
+
+def get_convenios(
+    spark: SparkSession,
+    lista_cpf: List[str],
+    data_referencia: str,
+    logger: Logger
+) -> DataFrame:
+    """
+    Get convenio data with specific business logic
+    """
+    logger.info("Getting convenio data")
+    
+    try:
+        cpf_condition = "', '".join(lista_cpf)
+        
+        query = f"""
+        SELECT 
+            cod_idef_pess,
+            numero_convenio,
+            tipo_convenio,
+            margem_disponivel,
+            valor_parcela_atual
+        FROM marg_cred
+        WHERE cod_idef_pess IN ('{cpf_condition}')
+        AND data_referencia = '{data_referencia}'
+        AND status_convenio = 'ATIVO'
+        """
+        
+        df = spark.sql(query)
+        log_dataframe_info(df, "marg_cred", logger)
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error in get_convenios: {str(e)}")
+        return spark.createDataFrame([], schema="cod_idef_pess string")
+
+
+def get_agded(
+    spark: SparkSession,
+    lista_cpf: List[str],
+    data_referencia: str,
+    logger: Logger
+) -> DataFrame:
+    """
+    Get AGDED data with specific transformations
+    """
+    logger.info("Getting AGDED data")
+    
+    try:
+        cpf_condition = "', '".join(lista_cpf)
+        
+        query = f"""
+        SELECT 
+            cod_idef_pess,
+            codigo_agencia,
+            digito_agencia,
+            nome_agencia,
+            codigo_produto
+        FROM customer_registration_notes
+        WHERE cod_idef_pess IN ('{cpf_condition}')
+        AND data_referencia = '{data_referencia}'
+        """
+        
+        df = spark.sql(query)
+        log_dataframe_info(df, "customer_registration_notes", logger)
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error in get_agded: {str(e)}")
+        return spark.createDataFrame([], schema="cod_idef_pess string")
