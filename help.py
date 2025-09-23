@@ -1,119 +1,86 @@
-from datetime import datetime
+import logging
 from logging import Logger
 
-import pyspark.sql.functions as F
-from pyspark.sql import DataFrame
-from pyspark.sql.types import LongType, StructField, StructType
+from awsglue.context import GlueContext
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql import DataFrame, SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+
+MSG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+TIMEZONE_SP = "America/Sao_Paulo"
+
+logging.basicConfig(format=MSG_FORMAT, datefmt=DATETIME_FORMAT)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 
-def atribui_num_lote(resultado_df: DataFrame, numero_lote_spec: int) -> DataFrame:
-    """Atribui números de lote ao DataFrame"""
-    new_schemas = StructType([StructField('index', LongType(), False)] + resultado_df.schema.fields[:])
-    resultado_df = (resultado_df.rdd.zipWithIndex().map(lambda x: (x[1] + 1,) + x[0]).toDF(schema=new_schemas))
-    resultado_df = resultado_df.withColumn('num_lote', ((F.col('index') / numero_lote_spec).cast('int') + 1)).drop('index')
-    return resultado_df
+def spark_sql_query(glue_context, spark, query, mapping, transformation_ctx) -> DynamicFrame:
+    """Executa consulta SQL em DataFrames do Spark."""
+    for alias, frame in mapping.items():
+        frame.toDF().createOrReplaceTemView(alias)
+    result = spark.sql(query)
+    return DynamicFrame.fromDF(result, glue_context, transformation_ctx)
 
 
-def get_lista_particoes_spec_from_catalog(
-        num_ano_mes_dia: str,
-        glue_client_role,
-        database_name_spec: str,
-        table_name_spec: str,
-        lake_control_account_id: str
-        ):
-    """Obtém lista de partições do catálogo Glue"""
-    list_particoes = []
-
-    partition_info = glue_client_role.get_partitions(
-        DatabaseName=database_name_spec,
-        TableName=table_name_spec,
-        ExcludeColumnSchema=True,
-        Expression=f"num_ano_mes_dia={num_ano_mes_dia}",
-        CatalogId=lake_control_account_id,
-    )
-
-    while True:
-        if partition_info.get("Partitions"):
-            for partition in partition_info["Partitions"]:
-                if len(partition['Values']) != 0:
-                    list_particoes.append({'Values': partition['Values']})
-
-        next_token = partition_info.get("NextToken")
-        if not next_token:
-            break
-
-        partition_info = glue_client_role.get_partitions(
-            DatabaseName=database_name_spec,
-            TableName=table_name_spec,
-            ExcludeColumnSchema=True,
-            NextToken=next_token,
-            Expression=f"num_ano_mes_dia={num_ano_mes_dia}",
-            CatalogId=lake_control_account_id,
-        )
-
-    return list_particoes
+def create_data_frame(glue_context: GlueContext, database: str, table_name: str) -> DataFrame:
+    """Cria DataFrame a partir de tabela do catálogo do Glue."""
+    columns = []
+    try:
+        df = glue_context.create_dynamic_frame.from_catalog(
+                database, table_name, transformation_ctx="dynamic_frame"
+            ).toDF()
+        columns = df.dtypes
+        return df
+    except Exception as e:
+        logger.error(f"Erro ao criar DataFrame para tabela {table_name}: {str(e)}")
+        # Cria DataFrame vazio com dados de erro
+        error_data = []
+        for column, dtype in columns:
+            if dtype == "string":
+                error_data.append("-2")
+            elif dtype == "boolean":
+                error_data.append(False)
+            elif dtype == "double":
+                error_data.append(-2.0)
+            else:
+                error_data.append(None)
+        
+        if error_data:
+            return spark.createDataFrame([error_data], [col[0] for col in columns])
+        else:
+            return spark.createDataFrame([], "cod_idef_pess string")
 
 
-def escrita_dados(
-    resultado_df: DataFrame,
-    numero_lote_spec: int,
-    logger: Logger,
-    glue_client_role,
-    database_name_spec: str,
-    table_name_spec: str,
-    lake_control_account_id: str,
-    s3_client,
-    s3_bucket_name: str = None,
-    s3_bucket_prefix: str = None) -> None:
-    """Escreve dados no S3 e atualiza o catálogo de dados"""
+def leitura_dados(logger: Logger, glue_client, spark: SparkSession, glue_context: GlueContext, lista_cpf: list, data_referencia: str) -> DataFrame:
+    """Função principal para ler dados de tabelas do catálogo usando configurações adequadas de banco de dados."""
+    
+    logger.info("Iniciando extração de dados das tabelas do catálogo")
     
     try:
-        logger.info("Iniciando processo de escrita de dados")
-        
-        # Valida parâmetros de entrada
-        if resultado_df is None or resultado_df.count() == 0:
-            logger.error("DataFrame vazio ou nulo fornecido")
-            return
-        
-        if numero_lote_spec <= 0:
-            logger.error(f"Número de lote inválido: {numero_lote_spec}")
-            return
+        # Importa função de consultas de banco de dados
+        from .database_queries import consulta_tabelas_main
 
-        # Atribui número de lote
-        partition_col = datetime.now().strftime("%Y%m%d")
-        resultado_df = atribui_num_lote(resultado_df, numero_lote_spec)
-        
-        # Obtém localização da tabela
-        table_info = glue_client_role.get_table(
-            DatabaseName=database_name_spec,
-            Name=table_name_spec,
-            CatalogId=lake_control_account_id
+        # Usa a função adequada de consulta de banco de dados que integra com database_mapping
+        logger.info("Executando consultas integradas de banco de dados...")
+        result_df = consulta_tabelas_main(
+            logger=logger,
+            glue_client=glue_client, 
+            spark=spark,
+            glue_context=glue_context,
+            lista_cpf=lista_cpf,
+            data_referencia=data_referencia
         )
         
-        location = table_info['Table']['StorageDescriptor']['Location']
+        # Conta registros
+        rows = result_df.count()
+        logger.info(f"Total de registros extraídos: {rows}")
+        logger.info("Extração de dados finalizada")
         
-        # Escreve no S3
-        write_to_s3(resultado_df, location, partition_col, logger)
-        
-        logger.info("Processo de escrita de dados concluído com sucesso")
-        
-    except Exception as e:
-        logger.error(f"Erro no processo de escrita de dados: {str(e)}")
-        raise
-
-
-def write_to_s3(resultado_df: DataFrame, location: str, partition_col: str, logger: Logger) -> None:
-    """Escreve DataFrame no S3"""
-    try:
-        logger.info(f"Escrevendo dados na localização S3: {location}")
-        
-        resultado_df.write \
-            .mode("append") \
-            .partitionBy("num_ano_mes_dia") \
-            .parquet(f"{location}/num_ano_mes_dia={partition_col}")
-            
-        logger.info("Dados escritos no S3 com sucesso")
+        return result_df
         
     except Exception as e:
-        logger.error(f"Erro ao escrever no S3: {str(e)}")
-        raise
+        logger.error(f"Erro na extração de dados: {str(e)}")
+        # Retorna DataFrame vazio em caso de erro
+        return spark.createDataFrame([], "cod_idef_pess string")
