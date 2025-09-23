@@ -1,380 +1,146 @@
-"""
-Database query functions for data preparation
-Based on atividade.md specifications
-"""
+import logging
+import sys
 
-from logging import Logger
-from typing import Dict, List, Optional, Tuple
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from pyspark import SparkContext
+from pyspark.sql import SparkSession
+from utils.data_validation import validate_etl_output_format
+from utils.escrita_dados import write_to_s3
+from utils.leitura_dados import leitura_dados
+from utils.refresh_boto_session import RefreshableBotoSession
+from utils.tratamento_dados import (agregacoes_campo, agrupa_por_id_pessoa,
+                                    calcula_idade, compacta_em_lotes,
+                                    formata_payload_dmp,
+                                    organiza_estruturas_pos_agrupamento,
+                                    set_indicadorCNAO, set_IndicadorSPI,
+                                    set_IndicadorSPO, tratamento_df)
 
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.functions import col, lit, when
 
-from .database_mapping import DatabaseMappingConfig, build_standardized_query
-from .data_validation import get_partition_filter, validate_dataframe_columns, log_dataframe_info
+def get_logger():
+    logger = logging.getLogger("pre_aprovado_consig_op")
+    logger.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        '%(asctime)s %(levelname)s %(name)s: %(message)s', '%Y-%m-%d %H:%M:%S')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    return logger
+
+spark = SparkSession.builder.getOrCreate()
 
 
-def consulta_tabelas_main(
-    spark: SparkSession,
-    lista_cpf: List[str],
-    data_referencia: str,
-    logger: Logger
-) -> DataFrame:
-    """
-    Main function to query all tables and combine results
-    """
-    logger.info("Starting main table queries")
+def main():
+    """Função principal de ETL para preparação de dados de consignado OP."""
     
-    # Initialize database mapping configuration
-    db_config = DatabaseMappingConfig()
+    # Inicializa logger
+    logger = get_logger()
     
-    # Get keyspace queries
-    df_keyspace = get_consultas_keyspace(spark, lista_cpf, data_referencia, logger)
+    # Analisa argumentos da linha de comando
+    args = getResolvedOptions(
+        sys.argv,
+        [
+            "JOB_NAME",
+            "DATABASE_SPEC",
+            "TABLE_SPEC",
+            "LAKE_CONTROL_ACCOUNT_ID",
+            "ROLE_ARN_DATAMESH",
+            "NUMERO_LOTE_PAYLOAD_DMP",
+            "NUMERO_LOTE_SPEC",
+            "LISTA_CPF",
+            "DATA_REFERENCIA",
+        ],
+    )
+
+    logger.info(f"Iniciando Job ETL: {args['JOB_NAME']}")
+
+    # Inicializa contextos Spark e Glue
+    sc = SparkContext.getOrCreate()
+    glue_context = GlueContext(sc)
+    spark = glue_context.spark_session
+    job = Job(glue_context)
+    job.init(args["JOB_NAME"], args)
+
+    # Configura clientes AWS com RefreshableBotoSession
+    refresh_boto_session = RefreshableBotoSession().refreshable_session()
+    refresh_boto_session_role = RefreshableBotoSession(
+        sts_arn=args["ROLE_ARN_DATAMESH"], session_name="addPartition"
+    ).refreshable_session()
+
+    glue_client_role = refresh_boto_session_role.client("glue")
+    s3_client = refresh_boto_session.client("s3")
+
+    # Extrai parâmetros
+    database_name_spec = args["DATABASE_SPEC"]
+    table_name_spec = args["TABLE_SPEC"]
+    lake_control_account_id = args["LAKE_CONTROL_ACCOUNT_ID"]
+    numero_lote_payload_dmp = int(args["NUMERO_LOTE_PAYLOAD_DMP"])
+    numero_lote_spec = int(args["NUMERO_LOTE_SPEC"])
+    lista_cpf = args["LISTA_CPF"].split(",") if args.get("LISTA_CPF") else []
+    data_referencia = args.get("DATA_REFERENCIA", "")
+
+    logger.info(f"Processando dados para banco: {database_name_spec}, tabela: {table_name_spec}")
+    logger.info(f"Processando {len(lista_cpf)} CPFs para data de referência: {data_referencia}")
+
+    logger.info("Iniciando execução do Job ETL...")
+
+    # Passo 1: Consulta todas as tabelas e obtém resultados combinados
+    logger.info("Passo 1: Lendo dados das tabelas do catálogo")
+    df_resultado = leitura_dados(logger, glue_client_role, spark, glue_context, lista_cpf, data_referencia)
     
-    # Get Aurora queries
-    df_aurora = get_consulta_aurora(spark, lista_cpf, data_referencia, logger)
-    
-    # Combine results
-    resultado_df = df_keyspace.union(df_aurora)
-    
-    logger.info(f"Combined query result count: {resultado_df.count()}")
-    return resultado_df
+    if df_resultado.count() == 0:
+        logger.warning("Nenhum dado encontrado nas consultas do banco de dados")
+        return
+
+    # Passo 2: Aplica tratamentos e transformações de dados
+    logger.info("Passo 2: Aplicando tratamentos de dados")
+    df_resultado = tratamento_df(df_resultado, logger)
+    df_resultado = calcula_idade(df_resultado)
+    df_resultado = set_IndicadorSPI(df_resultado)
+    df_resultado = set_IndicadorSPO(df_resultado)
+    df_resultado = set_indicadorCNAO(df_resultado)
+
+    # Passo 3: Agrupa por ID da pessoa e aplica funções de janela
+    logger.info("Passo 3: Agrupando dados por ID da pessoa")
+    df_resultado = agrupa_por_id_pessoa(df_resultado)
+
+    # Passo 4: Aplica agregações de campo
+    logger.info("Passo 4: Aplicando agregações de campo")
+    df_resultado = agregacoes_campo(df_resultado)
+
+    # Passo 5: Organiza estruturas após agrupamento
+    logger.info("Passo 5: Organizando estrutura JSON final")
+    df_resultado = organiza_estruturas_pos_agrupamento(df_resultado)
+
+    # Passo 6: Formata payload para DMP
+    logger.info("Passo 6: Formatando payload para DMP")
+    df_consig_op_batch = formata_payload_dmp(df_resultado, numero_lote_payload_dmp, logger)
+
+    # Passo 7: Compacta em lotes
+    logger.info("Passo 7: Compactando dados em lotes")
+    df_consig_op_batch = compacta_em_lotes(df_consig_op_batch, numero_lote_payload_dmp)
+
+    # Passo 8: Valida formato de saída
+    logger.info("Passo 8: Validando formato de saída")
+    validate_etl_output_format(df_consig_op_batch, logger)
+
+    write_to_s3(
+        df_consig_op_batch,
+        glue_client_role,
+        database_name_spec,
+        table_name_spec,
+        lake_control_account_id,
+        numero_lote_spec,
+        logger,
+        s3_client,
+    )
+
+    logger.info("Fim de execucao do processo")
+    job.commit()
 
 
-def get_consultas_keyspace(
-    spark: SparkSession,
-    lista_cpf: List[str],
-    data_referencia: str,
-    logger: Logger
-) -> DataFrame:
-    """
-    Execute queries for Keyspace tables
-    """
-    logger.info("Executing Keyspace queries")
-    
-    db_config = DatabaseMappingConfig()
-    keyspace_tables = [
-        "conv_cola_info",
-        "employee_contract_info", 
-        "customer_credit_view",
-        "vsao_cred_clie",
-        "ctrt_cred_csgd",
-        "rend_elto_pfis",
-        "grup_vsao_clie_dm"
-    ]
-    
-    dataframes = []
-    
-    for table_name in keyspace_tables:
-        try:
-            df = consulta_tabelas_mapped(
-                spark, table_name, lista_cpf, data_referencia, logger
-            )
-            if df is not None:
-                dataframes.append(df)
-        except Exception as e:
-            logger.error(f"Error querying table {table_name}: {str(e)}")
-            continue
-    
-    if dataframes:
-        resultado_df = dataframes[0]
-        for df in dataframes[1:]:
-            resultado_df = resultado_df.union(df)
-        return resultado_df
-    else:
-        # Return empty DataFrame with expected schema
-        return spark.createDataFrame([], schema="cod_idef_pess string")
-
-
-def get_consulta_aurora(
-    spark: SparkSession,
-    lista_cpf: List[str],
-    data_referencia: str,
-    logger: Logger
-) -> DataFrame:
-    """
-    Execute queries for Aurora tables
-    """
-    logger.info("Executing Aurora queries")
-    
-    aurora_tables = [
-        "mode_elto_pfis",
-        "cred_clie_pfis", 
-        "pgto_salr_spi",
-        "trsf_cont_salr",
-        "dtbc_mode_claf_brau",
-        "mode_csgd_crss_dm",
-        "crgo_clie_dm",
-        "vncl_orgo_pubi_dm",
-        "risc_cred_csgb"
-    ]
-    
-    dataframes = []
-    
-    for table_name in aurora_tables:
-        try:
-            df = consulta_tabelas_mapped(
-                spark, table_name, lista_cpf, data_referencia, logger
-            )
-            if df is not None:
-                dataframes.append(df)
-        except Exception as e:
-            logger.error(f"Error querying Aurora table {table_name}: {str(e)}")
-            continue
-    
-    if dataframes:
-        resultado_df = dataframes[0]
-        for df in dataframes[1:]:
-            resultado_df = resultado_df.union(df)
-        return resultado_df
-    else:
-        # Return empty DataFrame with expected schema
-        return spark.createDataFrame([], schema="cod_idef_pess string")
-
-
-def consulta_tabelas_mapped(
-    spark: SparkSession,
-    table_name: str,
-    lista_cpf: List[str],
-    data_referencia: str,
-    logger: Logger
-) -> Optional[DataFrame]:
-    """
-    Query tables using database mapping configuration
-    """
-    try:
-        db_config = DatabaseMappingConfig()
-        
-        if table_name not in db_config.table_mappings:
-            logger.warning(f"Table {table_name} not found in mappings")
-            return None
-        
-        # Build standardized query
-        query = build_standardized_query(
-            table_name=table_name,
-            cpf_list=lista_cpf,
-            reference_date=data_referencia
-        )
-        
-        logger.info(f"Executing query for table {table_name}")
-        logger.debug(f"Query: {query}")
-        
-        # Execute query
-        df = spark.sql(query)
-        
-        # Validate and log DataFrame info
-        validate_dataframe_columns(df, logger)
-        log_dataframe_info(df, table_name, logger)
-        
-        return df
-        
-    except Exception as e:
-        logger.error(f"Error in consulta_tabelas_mapped for {table_name}: {str(e)}")
-        return None
-
-
-def consulta_tabelas_convenio(
-    spark: SparkSession,
-    lista_cpf: List[str],
-    data_referencia: str,
-    logger: Logger
-) -> DataFrame:
-    """
-    Query convenio tables with specific logic
-    """
-    logger.info("Executing convenio queries")
-    
-    try:
-        # Build convenio query
-        cpf_condition = "', '".join(lista_cpf)
-        
-        query = f"""
-        SELECT 
-            cod_idef_pess,
-            numero_convenio,
-            nome_convenio,
-            data_inicio_convenio,
-            data_fim_convenio
-        FROM events_convenio
-        WHERE cod_idef_pess IN ('{cpf_condition}')
-        AND data_referencia = '{data_referencia}'
-        """
-        
-        df = spark.sql(query)
-        log_dataframe_info(df, "events_convenio", logger)
-        
-        return df
-        
-    except Exception as e:
-        logger.error(f"Error in consulta_tabelas_convenio: {str(e)}")
-        return spark.createDataFrame([], schema="cod_idef_pess string")
-
-
-def spark_sql_query(
-    spark: SparkSession,
-    query: str,
-    logger: Logger
-) -> Optional[DataFrame]:
-    """
-    Execute SQL query with error handling
-    """
-    try:
-        logger.debug(f"Executing SQL query: {query}")
-        df = spark.sql(query)
-        return df
-    except Exception as e:
-        logger.error(f"Error executing SQL query: {str(e)}")
-        return None
-
-
-def create_data_frame(
-    spark: SparkSession,
-    database: str,
-    table: str,
-    logger: Logger
-) -> Optional[DataFrame]:
-    """
-    Create DataFrame from Glue catalog
-    """
-    try:
-        full_table_name = f"{database}.{table}"
-        logger.info(f"Creating DataFrame for {full_table_name}")
-        
-        df = spark.table(full_table_name)
-        return df
-        
-    except Exception as e:
-        logger.error(f"Error creating DataFrame for {database}.{table}: {str(e)}")
-        return None
-
-
-def add_missing_columns_with_nulls(
-    df: DataFrame,
-    expected_columns: List[str],
-    logger: Logger
-) -> DataFrame:
-    """
-    Add missing columns with null values
-    """
-    try:
-        existing_columns = df.columns
-        missing_columns = [col for col in expected_columns if col not in existing_columns]
-        
-        if missing_columns:
-            logger.info(f"Adding missing columns: {missing_columns}")
-            for col_name in missing_columns:
-                df = df.withColumn(col_name, lit(None))
-        
-        return df.select(*expected_columns)
-        
-    except Exception as e:
-        logger.error(f"Error adding missing columns: {str(e)}")
-        return df
-
-
-def get_publico_correntista(
-    spark: SparkSession,
-    lista_cpf: List[str],
-    data_referencia: str,
-    logger: Logger
-) -> DataFrame:
-    """
-    Get public account holder data
-    """
-    logger.info("Getting public account holder data")
-    
-    try:
-        cpf_condition = "', '".join(lista_cpf)
-        
-        query = f"""
-        SELECT 
-            cod_idef_pess,
-            indicador_publico,
-            data_inicio_conta,
-            data_ultima_movimentacao
-        FROM public_person_view
-        WHERE cod_idef_pess IN ('{cpf_condition}')
-        AND data_referencia = '{data_referencia}'
-        """
-        
-        df = spark.sql(query)
-        log_dataframe_info(df, "public_person_view", logger)
-        
-        return df
-        
-    except Exception as e:
-        logger.error(f"Error in get_publico_correntista: {str(e)}")
-        return spark.createDataFrame([], schema="cod_idef_pess string")
-
-
-def get_convenios(
-    spark: SparkSession,
-    lista_cpf: List[str],
-    data_referencia: str,
-    logger: Logger
-) -> DataFrame:
-    """
-    Get convenio data with specific business logic
-    """
-    logger.info("Getting convenio data")
-    
-    try:
-        cpf_condition = "', '".join(lista_cpf)
-        
-        query = f"""
-        SELECT 
-            cod_idef_pess,
-            numero_convenio,
-            tipo_convenio,
-            margem_disponivel,
-            valor_parcela_atual
-        FROM marg_cred
-        WHERE cod_idef_pess IN ('{cpf_condition}')
-        AND data_referencia = '{data_referencia}'
-        AND status_convenio = 'ATIVO'
-        """
-        
-        df = spark.sql(query)
-        log_dataframe_info(df, "marg_cred", logger)
-        
-        return df
-        
-    except Exception as e:
-        logger.error(f"Error in get_convenios: {str(e)}")
-        return spark.createDataFrame([], schema="cod_idef_pess string")
-
-
-def get_agded(
-    spark: SparkSession,
-    lista_cpf: List[str],
-    data_referencia: str,
-    logger: Logger
-) -> DataFrame:
-    """
-    Get AGDED data with specific transformations
-    """
-    logger.info("Getting AGDED data")
-    
-    try:
-        cpf_condition = "', '".join(lista_cpf)
-        
-        query = f"""
-        SELECT 
-            cod_idef_pess,
-            codigo_agencia,
-            digito_agencia,
-            nome_agencia,
-            codigo_produto
-        FROM customer_registration_notes
-        WHERE cod_idef_pess IN ('{cpf_condition}')
-        AND data_referencia = '{data_referencia}'
-        """
-        
-        df = spark.sql(query)
-        log_dataframe_info(df, "customer_registration_notes", logger)
-        
-        return df
-        
-    except Exception as e:
-        logger.error(f"Error in get_agded: {str(e)}")
-        return spark.createDataFrame([], schema="cod_idef_pess string")
+if __name__ == "__main__":
+    main()
