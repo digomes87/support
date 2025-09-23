@@ -1,148 +1,393 @@
-import sys
-import logging
-from logging import Logger
+"""
+Data Validation and Utility Functions
 
-import boto3
-from pyspark import SparkContext
-from pyspark.sql import SparkSession
+This module provides utility functions for safe data type casting, 
+partition filtering, and data validation for the ETL process.
+"""
 
-from awsglue.context import GlueContext
-from awsglue.job import Job
-from awsglue.utils import getResolvedOptions
-
-from utils.escrita_dados import write_to_s3
-from utils.leitura_dados import leitura_dados
-from utils.refresh_boto_session import RefreshableBotoSession
-from utils.tratamento_dados import (
-    compacta_em_lotes, formata_payload_dmp, tratamento_df,
-    agrupa_por_id_pessoa, agregacoes_campo, organiza_estruturas_pos_agrupamento,
-    set_IndicadorSPI, set_IndicadorSPO, set_indicadorCNAO, calcula_idade
+import json
+from typing import Any, Dict, List, Optional, Union
+from pyspark.sql.types import (
+    StringType, IntegerType, DoubleType, DecimalType, 
+    BooleanType, DateType, TimestampType
 )
-from utils.data_validation import validate_etl_output_format
-
-def get_logger():
-    logger = logging.getLogger("pre_aprovado_consig_op")
-    logger.setLevel(logging.INFO)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter(
-        '%(asctime)s %(levelname)s %(name)s: %(message)s', '%Y-%m-%d %H:%M:%S')
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    return logger
-
-spark = SparkSession.builder.getOrCreate()
 
 
-def main():
-    """Main ETL function for consignado OP data preparation."""
+# Column type mappings for data validation
+COLUMN_TYPE = {
+    "cod_idef_pess": StringType(),
+    "CorrentistaAntigo": IntegerType(),
+    "Claro_Nao": IntegerType(),
+    "Cod_visao_Cliente": IntegerType(),
+    "Modalidade_Operacao": IntegerType(),
+    "Parcela_Mercado": DecimalType(10, 2),
+    "tipoInstituicao": StringType(),
+    "Situacao_BX": IntegerType(),
+    "Apontamento_BX": StringType(),
+    "Idade": StringType(),
+    "Indicador_SPO": StringType(),
+    "Cross_Consignado": IntegerType(),
+    "Gene_Emprego": IntegerType(),
+    "Target": IntegerType(),
+    "Codigo_Exclusao_Comercial": StringType(),
+    "Vinculo": StringType(),
+    "Cargos": StringType(),
+    "Renda_Sispag": DecimalType(15, 2),
+    "Valor_Contratado_Interno": DecimalType(15, 2),
+    "Numero_Conveio": StringType(),
+    "pct_maxi_cpmm_rend": DecimalType(5, 2),
+    "qtpzmax": IntegerType(),
+    "Parcela_Elegivel_Refin": DecimalType(15, 2),
+    "Indicador_SPI": StringType()
+}
+
+
+def safe_numeric_cast(column_name: str, target_type: str, alias: str) -> str:
+    """
+    Generate safe numeric casting SQL expression.
     
-    # Initialize logger
-    logger = get_logger()
+    Args:
+        column_name: Name of the column to cast
+        target_type: Target data type (STRING, INT, DECIMAL, etc.)
+        alias: Alias for the resulting column
     
-    # Parse command line arguments
-    args = getResolvedOptions(
-        sys.argv,
-        [
-            "JOB_NAME",
-            "DATABASE_SPEC",
-            "TABLE_SPEC",
-            "LAKE_CONTROL_ACCOUNT_ID",
-            "ROLE_ARN_DATAMESH",
-            "NUMERO_LOTE_PAYLOAD_DMP",
-            "NUMERO_LOTE_SPEC",
-            "LISTA_CPF",
-            "DATA_REFERENCIA",
-        ],
-    )
+    Returns:
+        SQL CAST expression with null handling
+    """
+    return f"CASE WHEN {column_name} IS NULL THEN CAST(-1 AS {target_type}) ELSE CAST({column_name} AS {target_type}) END AS {alias}"
 
-    logger.info(f"Starting ETL Job: {args['JOB_NAME']}")
 
-    # Initialize Spark and Glue contexts
-    sc = SparkContext.getOrCreate()
-    glue_context = GlueContext(sc)
-    spark = glue_context.spark_session
-    job = Job(glue_context)
-    job.init(args["JOB_NAME"], args)
-
-    # Setup AWS clients with RefreshableBotoSession
-    refresh_boto_session = RefreshableBotoSession().refreshable_session()
-    refresh_boto_session_role = RefreshableBotoSession(
-        sts_arn=args["ROLE_ARN_DATAMESH"], session_name="addPartition"
-    ).refreshable_session()
-
-    glue_client_role = refresh_boto_session_role.client("glue")
-    s3_client = refresh_boto_session.client("s3")
-
-    # Extract parameters
-    database_name_spec = args["DATABASE_SPEC"]
-    table_name_spec = args["TABLE_SPEC"]
-    lake_control_account_id = args["LAKE_CONTROL_ACCOUNT_ID"]
-    numero_lote_payload_dmp = int(args["NUMERO_LOTE_PAYLOAD_DMP"])
-    numero_lote_spec = int(args["NUMERO_LOTE_SPEC"])
-    lista_cpf = args["LISTA_CPF"].split(",") if args.get("LISTA_CPF") else []
-    data_referencia = args.get("DATA_REFERENCIA", "")
-
-    logger.info(f"Processing data for database: {database_name_spec}, table: {table_name_spec}")
-    logger.info(f"Processing {len(lista_cpf)} CPFs for reference date: {data_referencia}")
-
-    logger.info("Starting ETL Job execution...")
-
-    # Step 1: Query all tables and get combined results
-    logger.info("Step 1: Reading data from catalog tables")
-    df_resultado = leitura_dados(logger, glue_client_role, spark, glue_context, lista_cpf, data_referencia)
+def safe_numeric_where_condition(column_name: str, exclude_value: Union[int, float]) -> str:
+    """
+    Generate safe WHERE condition for numeric columns.
     
-    if df_resultado.count() == 0:
-        logger.warning("No data found in database queries")
-        return
-
-    # Step 2: Apply data treatments and transformations
-    logger.info("Step 2: Applying data treatments")
-    df_resultado = tratamento_df(df_resultado, logger)
-    df_resultado = calcula_idade(df_resultado)
-    df_resultado = set_IndicadorSPI(df_resultado)
-    df_resultado = set_IndicadorSPO(df_resultado)
-    df_resultado = set_indicadorCNAO(df_resultado)
-
-    # Step 3: Group by person ID and apply window functions
-    logger.info("Step 3: Grouping data by person ID")
-    df_resultado = agrupa_por_id_pessoa(df_resultado)
-
-    # Step 4: Apply field aggregations
-    logger.info("Step 4: Applying field aggregations")
-    df_resultado = agregacoes_campo(df_resultado)
-
-    # Step 5: Organize structures after grouping
-    logger.info("Step 5: Organizing final JSON structure")
-    df_resultado = organiza_estruturas_pos_agrupamento(df_resultado)
-
-    # Step 6: Format payload for DMP
-    logger.info("Step 6: Formatting payload for DMP")
-    df_consig_op_batch = formata_payload_dmp(df_resultado, numero_lote_payload_dmp, logger)
-
-    # Step 7: Compact into batches
-    logger.info("Step 7: Compacting data into batches")
-    df_consig_op_batch = compacta_em_lotes(df_consig_op_batch, numero_lote_payload_dmp)
-
-    # Step 8: Validate output format
-    logger.info("Step 8: Validating output format")
-    validate_etl_output_format(df_consig_op_batch, logger)
-
-    write_to_s3(
-        df_consig_op_batch,
-        glue_client_role,
-        database_name_spec,
-        table_name_spec,
-        lake_control_account_id,
-        numero_lote_spec,
-        logger,
-        s3_client,
-    )
-
-    logger.info("Fim de execucao do processo")
-    job.commit()
+    Args:
+        column_name: Name of the column
+        exclude_value: Value to exclude from results
+    
+    Returns:
+        SQL WHERE condition with null handling
+    """
+    return f"({column_name} IS NULL OR {column_name} != {exclude_value})"
 
 
-if __name__ == "__main__":
-    main()
+def get_partition_filter(database_name: str, table_name: str, glue_client) -> str:
+    """
+    Get partition filter for the latest partition of a table.
+    
+    Args:
+        database_name: Name of the database
+        table_name: Name of the table
+        glue_client: AWS Glue client instance
+    
+    Returns:
+        Partition filter string for the latest partition
+    """
+    try:
+        # Get table partitions from Glue catalog
+        response = glue_client.get_partitions(
+            DatabaseName=database_name,
+            TableName=table_name,
+            MaxResults=1000
+        )
+        
+        partitions = response.get('Partitions', [])
+        
+        if not partitions:
+            return ""
+        
+        # Find the latest partition based on partition values
+        latest_partition = max(partitions, key=lambda p: p.get('Values', []))
+        partition_keys = latest_partition.get('StorageDescriptor', {}).get('Columns', [])
+        partition_values = latest_partition.get('Values', [])
+        
+        if not partition_keys or not partition_values:
+            return ""
+        
+        # Build partition filter
+        filter_conditions = []
+        for i, key_info in enumerate(partition_keys):
+            if i < len(partition_values):
+                key_name = key_info.get('Name', '')
+                key_value = partition_values[i]
+                filter_conditions.append(f"{key_name} = '{key_value}'")
+        
+        return " AND ".join(filter_conditions)
+        
+    except Exception as e:
+        # Return empty string if partition filtering fails
+        return ""
+
+
+class JSONSchemaValidator:
+    """
+    JSON Schema Validator for ETL output format validation.
+    """
+    
+    def __init__(self):
+        """Initialize the validator with expected schema"""
+        self.expected_schema = {
+            "type": "object",
+            "required": ["payloadIdentification", "payloadInput", "payloadAudit"],
+            "properties": {
+                "payloadIdentification": {
+                    "type": "object",
+                    "required": [
+                        "nom_fncd_serv_nego", "cod_idef_prpt_sist_prod", 
+                        "cod_idef_tran_sist_cred", "cod_idef_job_jorn",
+                        "cod_idef_tran_sist_prod", "cod_idef_prso_nego",
+                        "cod_idef_pess", "cod_tipo_pess"
+                    ],
+                    "properties": {
+                        "nom_fncd_serv_nego": {"type": "string"},
+                        "cod_idef_prpt_sist_prod": {"type": "string"},
+                        "cod_idef_tran_sist_cred": {"type": "string"},
+                        "cod_idef_job_jorn": {"type": "string"},
+                        "cod_idef_tran_sist_prod": {"type": "string"},
+                        "cod_idef_prso_nego": {"type": "string"},
+                        "cod_idef_pess": {"type": "string"},
+                        "nom_prso_sist_cred": {"type": "string"},
+                        "cod_stat_decs": {"type": "string"},
+                        "nom_tipo_decs_prpt": {"type": "string"},
+                        "nom_moto_anal_prpt": {"type": "string"},
+                        "cod_tipo_pess": {"type": "string"},
+                        "nom_prod_cred": {"type": "string"},
+                        "nom_fase_cred": {"type": "string"},
+                        "nom_pilo_pltc_cred": {"type": "string"},
+                        "cod_vers_pltc": {"type": "string"},
+                        "cod_vers_tecn_pltc": {"type": "string"},
+                        "dat_hor_exeo_descs": {"type": "string"}
+                    }
+                },
+                "payloadInput": {
+                    "type": "object",
+                    "required": ["tipoProcesso", "solicitacao", "proponente"],
+                    "properties": {
+                        "tipoProcesso": {"type": "string"},
+                        "solicitacao": {
+                            "type": "object",
+                            "properties": {
+                                "codCanal": {"type": "integer"},
+                                "codsubCanal": {"type": "integer"},
+                                "numeroConvenio": {"type": "string"}
+                            }
+                        },
+                        "dadosOferta": {
+                            "type": "object",
+                            "properties": {
+                                "flagInelebilidadeForte": {"type": "integer"}
+                            }
+                        },
+                        "listaValoresCalculados": {
+                            "type": "object",
+                            "properties": {
+                                "percentual": {"type": "number"},
+                                "prazo": {"type": "integer"},
+                                "vlrParcelaElegivel": {"type": "number"}
+                            }
+                        },
+                        "proponente": {
+                            "type": "object",
+                            "required": ["numeroDocumento"],
+                            "properties": {
+                                "numeroDocumento": {"type": "string"},
+                                "listaContratos": {"type": "array"},
+                                "dadosEndividamento": {
+                                    "type": "object",
+                                    "properties": {
+                                        "valorParcConsignado": {"type": "number"},
+                                        "valorParcConsignadoItau": {"type": "number"}
+                                    }
+                                },
+                                "dadosFatorRisco": {
+                                    "type": "object",
+                                    "properties": {
+                                        "listaExclusao": {"type": "array"},
+                                        "listaApontamentos": {"type": "array"},
+                                        "geneEmprego": {"type": "integer"}
+                                    }
+                                },
+                                "indCorrentistaAntigo": {
+                                    "type": "object",
+                                    "properties": {
+                                        "indCorrentistaAntigo": {"type": "integer"}
+                                    }
+                                },
+                                "dadosBacen": {
+                                    "type": "object",
+                                    "properties": {
+                                        "codSubModalidadeOperacao": {"type": "integer"},
+                                        "tipoInstituicao": {"type": "string"}
+                                    }
+                                },
+                                "dadosPessoaFisica": {
+                                    "type": "object",
+                                    "properties": {
+                                        "idadeCliente": {"type": "string"},
+                                        "spiVisaoConta": {"type": "string"},
+                                        "spoVisaoConta": {"type": "string"},
+                                        "listaVinculos": {"type": "array"},
+                                        "listaCargos": {"type": "array"}
+                                    }
+                                },
+                                "dadosVisaoCliente": {
+                                    "type": "object",
+                                    "properties": {
+                                        "rating": {"type": "integer"}
+                                    }
+                                },
+                                "dadosModelos": {
+                                    "type": "object",
+                                    "properties": {
+                                        "crossConsignado": {"type": "integer"},
+                                        "visaoCliente": {"type": "integer"},
+                                        "geneEmprego": {"type": "integer"}
+                                    }
+                                },
+                                "dadosRenda": {
+                                    "type": "object",
+                                    "properties": {
+                                        "rendaInternaCliente": {"type": "number"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "payloadAudit": {
+                    "type": "object",
+                    "required": ["auditSteps", "calculatedVars", "isAuditEnabled", "isCalculatedVarsEnabled"],
+                    "properties": {
+                        "auditSteps": {"type": "array"},
+                        "calculatedVars": {"type": "array"},
+                        "isAuditEnabled": {"type": "boolean"},
+                        "isCalculatedVarsEnabled": {"type": "boolean"}
+                    }
+                }
+            }
+        }
+    
+    def validate_structure(self, data: Dict[str, Any]) -> tuple[bool, List[str]]:
+        """
+        Validate data structure against expected schema.
+        
+        Args:
+            data: Data dictionary to validate
+        
+        Returns:
+            Tuple of (is_valid, error_messages)
+        """
+        errors = []
+        
+        try:
+            # Basic structure validation
+            if not isinstance(data, dict):
+                errors.append("Data must be a dictionary")
+                return False, errors
+            
+            # Check required top-level fields
+            required_fields = ["payloadIdentification", "payloadInput", "payloadAudit"]
+            for field in required_fields:
+                if field not in data:
+                    errors.append(f"Missing required field: {field}")
+            
+            # Validate payloadIdentification
+            if "payloadIdentification" in data:
+                payload_id = data["payloadIdentification"]
+                if not isinstance(payload_id, dict):
+                    errors.append("payloadIdentification must be a dictionary")
+                else:
+                    required_id_fields = [
+                        "nom_fncd_serv_nego", "cod_idef_prpt_sist_prod",
+                        "cod_idef_tran_sist_cred", "cod_idef_pess"
+                    ]
+                    for field in required_id_fields:
+                        if field not in payload_id:
+                            errors.append(f"Missing required field in payloadIdentification: {field}")
+            
+            # Validate payloadInput
+            if "payloadInput" in data:
+                payload_input = data["payloadInput"]
+                if not isinstance(payload_input, dict):
+                    errors.append("payloadInput must be a dictionary")
+                else:
+                    if "proponente" not in payload_input:
+                        errors.append("Missing required field in payloadInput: proponente")
+                    elif "numeroDocumento" not in payload_input["proponente"]:
+                        errors.append("Missing required field in proponente: numeroDocumento")
+            
+            # Validate payloadAudit
+            if "payloadAudit" in data:
+                payload_audit = data["payloadAudit"]
+                if not isinstance(payload_audit, dict):
+                    errors.append("payloadAudit must be a dictionary")
+                else:
+                    required_audit_fields = ["auditSteps", "calculatedVars", "isAuditEnabled", "isCalculatedVarsEnabled"]
+                    for field in required_audit_fields:
+                        if field not in payload_audit:
+                            errors.append(f"Missing required field in payloadAudit: {field}")
+            
+            return len(errors) == 0, errors
+            
+        except Exception as e:
+            errors.append(f"Validation error: {str(e)}")
+            return False, errors
+
+
+def validate_etl_output_format(data: Dict[str, Any]) -> tuple[bool, List[str]]:
+    """
+    Validate ETL output format using JSONSchemaValidator.
+    
+    Args:
+        data: Data dictionary to validate
+    
+    Returns:
+        Tuple of (is_valid, error_messages)
+    """
+    validator = JSONSchemaValidator()
+    return validator.validate_structure(data)
+
+
+def validate_dataframe_columns(df, required_columns: List[str], logger=None) -> bool:
+    """
+    Validate that DataFrame contains all required columns.
+    
+    Args:
+        df: Spark DataFrame to validate
+        required_columns: List of required column names
+        logger: Optional logger instance
+    
+    Returns:
+        True if all required columns are present, False otherwise
+    """
+    if df is None:
+        if logger:
+            logger.error("DataFrame is None")
+        return False
+    
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    
+    if missing_columns:
+        if logger:
+            logger.error(f"Missing required columns: {missing_columns}")
+        return False
+    
+    return True
+
+
+def log_dataframe_info(df, table_name: str, logger=None):
+    """
+    Log basic information about a DataFrame.
+    
+    Args:
+        df: Spark DataFrame
+        table_name: Name of the table/source
+        logger: Optional logger instance
+    """
+    if logger and df is not None:
+        try:
+            row_count = df.count()
+            column_count = len(df.columns)
+            logger.info(f"Table {table_name}: {row_count} rows, {column_count} columns")
+        except Exception as e:
+            logger.warning(f"Could not get info for table {table_name}: {str(e)}")
