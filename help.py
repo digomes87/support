@@ -1,122 +1,148 @@
-import copy
-import re
-from datetime import datetime
+import sys
+import logging
 from logging import Logger
 
-import botocore
-import pyspark.sql.functions as F
-from pyspark.sql import DataFrame
-from pyspark.sql.types import LongType, StructField, StructType
+import boto3
+from pyspark import SparkContext
+from pyspark.sql import SparkSession
+
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+
+from utils.escrita_dados import write_to_s3
+from utils.leitura_dados import leitura_dados
+from utils.refresh_boto_session import RefreshableBotoSession
+from utils.tratamento_dados import (
+    compacta_em_lotes, formata_payload_dmp, tratamento_df,
+    agrupa_por_id_pessoa, agregacoes_campo, organiza_estruturas_pos_agrupamento,
+    set_IndicadorSPI, set_IndicadorSPO, set_indicadorCNAO, calcula_idade
+)
+from utils.data_validation import validate_etl_output_format
+
+def get_logger():
+    logger = logging.getLogger("pre_aprovado_consig_op")
+    logger.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        '%(asctime)s %(levelname)s %(name)s: %(message)s', '%Y-%m-%d %H:%M:%S')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    return logger
+
+spark = SparkSession.builder.getOrCreate()
 
 
-def atribui_num_lote(resultado_df: DataFrame, numero_lote_spec: int) -> DataFrame:
-    """Assign batch numbers to DataFrame"""
-    new_schemas = StructType([StructField('index', LongType(), False)] + resultado_df.schema.fields[:])
-    resultado_df = (resultado_df.rdd.zipWithIndex().map(lambda x: (x[1] + 1,) + x[0]).toDF(schema=new_schemas))
-    resultado_df = resultado_df.withColumn('num_lote', ((F.col('index') / numero_lote_spec).cast('int') + 1)).drop('index')
-    return resultado_df
-
-
-def get_lista_particoes_spec_from_catalog(
-        num_ano_mes_dia: str,
-        glue_client_role,
-        database_name_spec: str,
-        table_name_spec: str,
-        lake_control_account_id: str
-        ):
-    """Get partition list from Glue catalog"""
-    list_particoes = []
-
-    partition_info = glue_client_role.get_partitions(
-        DatabaseName=database_name_spec,
-        TableName=table_name_spec,
-        ExcludeColumnSchema=True,
-        Expression=f"num_ano_mes_dia={num_ano_mes_dia}",
-        CatalogId=lake_control_account_id,
+def main():
+    """Main ETL function for consignado OP data preparation."""
+    
+    # Initialize logger
+    logger = get_logger()
+    
+    # Parse command line arguments
+    args = getResolvedOptions(
+        sys.argv,
+        [
+            "JOB_NAME",
+            "DATABASE_SPEC",
+            "TABLE_SPEC",
+            "LAKE_CONTROL_ACCOUNT_ID",
+            "ROLE_ARN_DATAMESH",
+            "NUMERO_LOTE_PAYLOAD_DMP",
+            "NUMERO_LOTE_SPEC",
+            "LISTA_CPF",
+            "DATA_REFERENCIA",
+        ],
     )
 
-    while True:
-        if partition_info.get("Partitions"):
-            for partition in partition_info["Partitions"]:
-                if len(partition['Values']) != 0:
-                    list_particoes.append({'Values': partition['Values']})
+    logger.info(f"Starting ETL Job: {args['JOB_NAME']}")
 
-        next_token = partition_info.get("NextToken")
-        if not next_token:
-            break
+    # Initialize Spark and Glue contexts
+    sc = SparkContext.getOrCreate()
+    glue_context = GlueContext(sc)
+    spark = glue_context.spark_session
+    job = Job(glue_context)
+    job.init(args["JOB_NAME"], args)
 
-        partition_info = glue_client_role.get_partitions(
-            DatabaseName=database_name_spec,
-            TableName=table_name_spec,
-            ExcludeColumnSchema=True,
-            NextToken=next_token,
-            Expression=f"num_ano_mes_dia={num_ano_mes_dia}",
-            CatalogId=lake_control_account_id,
-        )
+    # Setup AWS clients with RefreshableBotoSession
+    refresh_boto_session = RefreshableBotoSession().refreshable_session()
+    refresh_boto_session_role = RefreshableBotoSession(
+        sts_arn=args["ROLE_ARN_DATAMESH"], session_name="addPartition"
+    ).refreshable_session()
 
-    return list_particoes
+    glue_client_role = refresh_boto_session_role.client("glue")
+    s3_client = refresh_boto_session.client("s3")
 
+    # Extract parameters
+    database_name_spec = args["DATABASE_SPEC"]
+    table_name_spec = args["TABLE_SPEC"]
+    lake_control_account_id = args["LAKE_CONTROL_ACCOUNT_ID"]
+    numero_lote_payload_dmp = int(args["NUMERO_LOTE_PAYLOAD_DMP"])
+    numero_lote_spec = int(args["NUMERO_LOTE_SPEC"])
+    lista_cpf = args["LISTA_CPF"].split(",") if args.get("LISTA_CPF") else []
+    data_referencia = args.get("DATA_REFERENCIA", "")
 
-def escrita_dados(
-    resultado_df: DataFrame,
-    numero_lote_spec: int,
-    logger: Logger,
-    glue_client_role,
-    database_name_spec: str,
-    table_name_spec: str,
-    lake_control_account_id: str,
-    s3_client,
-    s3_bucket_name: str = None,
-    s3_bucket_prefix: str = None) -> None:
-    """Write data to S3 and update data catalog"""
+    logger.info(f"Processing data for database: {database_name_spec}, table: {table_name_spec}")
+    logger.info(f"Processing {len(lista_cpf)} CPFs for reference date: {data_referencia}")
+
+    logger.info("Starting ETL Job execution...")
+
+    # Step 1: Query all tables and get combined results
+    logger.info("Step 1: Reading data from catalog tables")
+    df_resultado = leitura_dados(logger, glue_client_role, spark, glue_context, lista_cpf, data_referencia)
     
-    try:
-        logger.info("Starting data writing process")
-        
-        # Validate input parameters
-        if resultado_df is None or resultado_df.count() == 0:
-            logger.error("Empty or null DataFrame provided")
-            return
-        
-        if numero_lote_spec <= 0:
-            logger.error(f"Invalid batch number: {numero_lote_spec}")
-            return
+    if df_resultado.count() == 0:
+        logger.warning("No data found in database queries")
+        return
 
-        # Assign batch number
-        partition_col = datetime.now().strftime("%Y%m%d")
-        resultado_df = atribui_num_lote(resultado_df, numero_lote_spec)
-        
-        # Get table location
-        table_info = glue_client_role.get_table(
-            DatabaseName=database_name_spec,
-            Name=table_name_spec,
-            CatalogId=lake_control_account_id
-        )
-        
-        location = table_info['Table']['StorageDescriptor']['Location']
-        
-        # Write to S3
-        write_to_s3(resultado_df, location, partition_col, logger)
-        
-        logger.info("Data writing process completed successfully")
-        
-    except Exception as e:
-        logger.error(f"Error in data writing process: {str(e)}")
-        raise
+    # Step 2: Apply data treatments and transformations
+    logger.info("Step 2: Applying data treatments")
+    df_resultado = tratamento_df(df_resultado, logger)
+    df_resultado = calcula_idade(df_resultado)
+    df_resultado = set_IndicadorSPI(df_resultado)
+    df_resultado = set_IndicadorSPO(df_resultado)
+    df_resultado = set_indicadorCNAO(df_resultado)
+
+    # Step 3: Group by person ID and apply window functions
+    logger.info("Step 3: Grouping data by person ID")
+    df_resultado = agrupa_por_id_pessoa(df_resultado)
+
+    # Step 4: Apply field aggregations
+    logger.info("Step 4: Applying field aggregations")
+    df_resultado = agregacoes_campo(df_resultado)
+
+    # Step 5: Organize structures after grouping
+    logger.info("Step 5: Organizing final JSON structure")
+    df_resultado = organiza_estruturas_pos_agrupamento(df_resultado)
+
+    # Step 6: Format payload for DMP
+    logger.info("Step 6: Formatting payload for DMP")
+    df_consig_op_batch = formata_payload_dmp(df_resultado, numero_lote_payload_dmp, logger)
+
+    # Step 7: Compact into batches
+    logger.info("Step 7: Compacting data into batches")
+    df_consig_op_batch = compacta_em_lotes(df_consig_op_batch, numero_lote_payload_dmp)
+
+    # Step 8: Validate output format
+    logger.info("Step 8: Validating output format")
+    validate_etl_output_format(df_consig_op_batch, logger)
+
+    write_to_s3(
+        df_consig_op_batch,
+        glue_client_role,
+        database_name_spec,
+        table_name_spec,
+        lake_control_account_id,
+        numero_lote_spec,
+        logger,
+        s3_client,
+    )
+
+    logger.info("Fim de execucao do processo")
+    job.commit()
 
 
-def write_to_s3(resultado_df: DataFrame, location: str, partition_col: str, logger: Logger) -> None:
-    """Write DataFrame to S3"""
-    try:
-        logger.info(f"Writing data to S3 location: {location}")
-        
-        resultado_df.write \
-            .mode("append") \
-            .partitionBy("num_ano_mes_dia") \
-            .parquet(f"{location}/num_ano_mes_dia={partition_col}")
-            
-        logger.info("Successfully wrote data to S3")
-        
-    except Exception as e:
-        logger.error(f"Error writing to S3: {str(e)}")
-        raise
+if __name__ == "__main__":
+    main()
