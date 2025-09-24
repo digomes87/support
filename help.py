@@ -1,248 +1,149 @@
-import uuid
-from logging import Logger
+import logging
+import sys
+from datetime import datetime
 
-from pyspark.sql import DataFrame, Window
-from pyspark.sql import functions as F
-from pyspark.sql.functions import (col, collect_list, current_date,
-                                   date_format, expr, lit, struct, to_date,
-                                   udf, when)
-from pyspark.sql.types import IntegerType, StringType
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from pyspark import SparkContext
+from pyspark.sql import SparkSession
+from utils.data_validation import validate_etl_output_format
+from utils.escrita_dados import write_to_s3
+from utils.leitura_dados import leitura_dados
+from utils.refresh_boto_session import RefreshableBotoSession
+from utils.tratamento_dados import (agregacoes_campo, agrupa_por_id_pessoa,
+                                    calcula_idade, compacta_em_lotes,
+                                    formata_payload_dmp,
+                                    organiza_estruturas_pos_agrupamento,
+                                    set_indicadorCNAO, set_IndicadorSPI,
+                                    set_IndicadorSPO, tratamento_df)
 
-uuid_udf = udf(lambda: str(uuid.uuid4()), StringType())
 
-def safe_coalesce(value, dtype, logger: Logger):
-    """Função de coalesce segura para tratar valores nulos"""
-    if value is not None and value != '':
-        return value
-    else:
-        if dtype == "string":
-            return -1
-        elif dtype == "double":
-            return -1.0
-        elif dtype == "boolean":
-            return False
-        elif dtype == "array":
-            return [-1]
-        elif dtype == "struct":
-            return {"default": "-1"}
-        else:
-            return -1
+def get_logger():
+    logger = logging.getLogger("pre_aprovado_consig_op")
+    logger.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        '%(asctime)s %(levelname)s %(name)s: %(message)s', '%Y-%m-%d %H:%M:%S')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
-def get_uuid_expr():
-    """Gera expressão UUID"""
-    return F.expr("uuid()")
+    return logger
 
-def formata_payload_dmp(resultado_df: DataFrame, numero_lote_payload_dmp: int, logger: Logger) -> DataFrame:
-    """Função principal para formatar DataFrame para payload DMP"""
-    logger.info("Iniciando formatação do DataFrame para payload DMP")
+spark = SparkSession.builder.getOrCreate()
+
+
+def main():
+    """Função principal de ETL para preparação de dados de consignado OP."""
     
-    resultado_df = tratamento_df(resultado_df, logger)
-    resultado_df = agrupa_por_id_pessoa(resultado_df)
-    resultado_df = agregacoes_campo(resultado_df)
-
-    if resultado_df is None:
-        logger.error("DataFrame é None")
-        return None
-        
-    resultado_df = organiza_estruturas_pos_agrupamento(resultado_df)
-    resultado_df = compacta_em_lotes(resultado_df, numero_lote_payload_dmp)
-    return resultado_df
-
-def tratamento_df(resultado_df: DataFrame, logger: Logger) -> DataFrame:
-    """Tratamento básico do DataFrame"""
-    logger.info("Iniciando tratamento básico do DataFrame")
+    # Inicializa logger
+    logger = get_logger()
     
-    # Adiciona colunas básicas com valores padrão
-    resultado_df = resultado_df.withColumn('rdgHash', lit(-1))
-    resultado_df = resultado_df.withColumn('isAuditEnabled', lit(True))
-    resultado_df = resultado_df.withColumn('isCalculatedVarsEnabled', lit(True))
+    # Analisa argumentos da linha de comando
+    args = getResolvedOptions(
+        sys.argv,
+        [
+            "JOB_NAME",
+            "DATABASE_SPEC",
+            "TABLE_SPEC",
+            "LAKE_CONTROL_ACCOUNT_ID",
+            "ROLE_ARN_DATAMESH",
+            "NUMERO_LOTE_PAYLOAD_DMP",
+            "NUMERO_LOTE_SPEC",
+            "S3_BUCKET_NAME",
+            "S3_BUCKET_PREFIX",
+        ],
+    )
+
+    logger.info(f"Iniciando Job ETL: {args['JOB_NAME']}")
+
+    # Inicializa contextos Spark e Glue
+    sc = SparkContext.getOrCreate()
+    glue_context = GlueContext(sc)
+    spark = glue_context.spark_session
+    job = Job(glue_context)
+    job.init(args["JOB_NAME"], args)
+
+    # Configura clientes AWS com RefreshableBotoSession
+    refresh_boto_session = RefreshableBotoSession().refreshable_session()
+    refresh_boto_session_role = RefreshableBotoSession(
+        sts_arn=args["ROLE_ARN_DATAMESH"], session_name="addPartition"
+    ).refreshable_session()
+
+    glue_client_role = refresh_boto_session_role.client("glue")
+    s3_client = refresh_boto_session.client("s3")
+
+    # Extrai parâmetros
+    database_name_spec = args["DATABASE_SPEC"]
+    table_name_spec = args["TABLE_SPEC"]
+    lake_control_account_id = args["LAKE_CONTROL_ACCOUNT_ID"]
+    numero_lote_payload_dmp = int(args["NUMERO_LOTE_PAYLOAD_DMP"])
+    numero_lote_spec = int(args["NUMERO_LOTE_SPEC"])
     
-    # Formatação de data
-    resultado_df = resultado_df.withColumn(
-        "dataBeneficio",
-        when(col("num_dat_incu_benf").isNull() | (col("num_dat_incu_benf") == ''), lit("0000-00-00"))
-        .otherwise(date_format(to_date(col("num_dat_incu_benf"), "dd.MM.yyyy"), "yyyy-MM-dd"))
-    )
+    # Generate current date automatically for system execution
+    data_referencia = datetime.now().strftime("%Y-%m-%d")
+    logger.info(f"Using current execution date: {data_referencia}")
+
+    logger.info(f"Processando dados para banco: {database_name_spec}, tabela: {table_name_spec}")
+    logger.info(f"Data de referência para execução: {data_referencia}")
+
+    logger.info("Iniciando execução do Job ETL...")
+
+    # Passo 1: Consulta todas as tabelas e obtém resultados combinados
+    logger.info("Passo 1: Lendo dados das tabelas do catálogo")
+    df_resultado = leitura_dados(logger, spark, glue_context, data_referencia)
     
-    # Cálculo de idade
-    resultado_df = resultado_df.withColumn(
-        "dataAtual",
-        current_date()
-    )
-    
-    resultado_df = resultado_df.withColumn(
-        "calculoIdade",
-        expr("datediff(dataAtual, to_date(num_dat_incu_benf, 'dd.MM.yyyy')) / 365.25")
-    )
-    
-    resultado_df = resultado_df.withColumn(
-        "idadeInt",
-        col("calculoIdade").cast(IntegerType())
-    )
-    
-    return resultado_df
+    if df_resultado.count() == 0:
+        logger.warning("Nenhum dado encontrado nas consultas do banco de dados")
+        return
 
-def agrupa_por_id_pessoa(resultado_df: DataFrame) -> DataFrame:
-    """Agrupa DataFrame por ID da pessoa com funções de janela"""
-    window_spec = Window.partitionBy('cod_idef_pess')
-    resultado_df = resultado_df.withColumn(
-        "valorTotalParcelaInterno",
-        F.sum('Valor_Contratado_Interno').over(window_spec)
-    )
-    resultado_df = resultado_df.withColumn(
-        "calculoDias",
-        col("Situacao_BX").alias("calculoDias")
-    )
-    resultado_df = resultado_df.withColumn(
-        "dias",
-        when(col("calculoDias").isNull(), lit(-1))
-        .otherwise(col("calculoDias")).cast(IntegerType())
-    )
-    return resultado_df
+    # Passo 2: Aplica tratamentos e transformações de dados
+    logger.info("Passo 2: Aplicando tratamentos de dados")
+    df_resultado = tratamento_df(df_resultado, logger)
+    df_resultado = calcula_idade(df_resultado)
+    df_resultado = set_IndicadorSPI(df_resultado)
+    df_resultado = set_IndicadorSPO(df_resultado)
+    df_resultado = set_indicadorCNAO(df_resultado)
 
-def agregacoes_campo(resultado_df: DataFrame) -> DataFrame:
-    """Agregações de campo com lógica de negócio específica"""
-    agregacoes = {
-        "dadosBacen": F.struct(
-           F.first('Modalidade_Operacao', True).alias("codSubModalidadeOperacao"),
-           F.first('tipoInstituicao').alias('tipoInstituicao')
-        ),
-        "dadosModelos": F.struct(
-            F.first('Cross_Consignado', True).alias("crossConsignado"),
-            F.first('Cod_visao_Cliente', True).alias("visaoCliente"),
-            F.first('Gene_Emprego').alias("geneEmprego")
-        ),
-        "dadosFatorRisco": F.struct(
-            F.collect_set('Codigo_Exclusao_Comercial').alias("listaExclusao"),
-            F.collect_set('Apontamento_BX').alias("listaApontamentos"),
-            F.first('Gene_Emprego', True).alias("geneEmprego")
-        ),
-        "dadosPessoaFisica": F.struct(
-            F.first('Idade', True).alias("idadeCliente"),
-            F.first('Indicador_SPI', True).alias("spiVisaoConta"),
-            F.first('Indicador_SPO', True).alias("spoVisaoConta"),
-            F.collect_set('Vinculo').alias('listaVinculos'),
-            F.collect_list('Cargos').alias('listaCargos')
-        ),
-        "dadosEndividamento": F.struct(
-                F.first('Parcela_Mercado', True).alias('valorParcConsignado'),
-                F.first('valorTotalParcelaInterno', True).alias('valorParcConsignadoItau')
-        ),
-        "dadosRenda": F.struct(
-                F.first('Renda_Sispag', True).alias('rendaInternaCliente')
-        ),
-        "dadosOferta": F.struct(
-                F.first('Claro_Nao', True).alias('flagInelebilidadeForte')
-        ),
-        "dadosVisaoCliente": F.struct(
-                F.first('Target', True).alias('rating')
-        ),
-        "listaValoresCalculados": F.struct(
-                F.first('pct_maxi_cpmm_rend').alias('percentual'),
-                F.first('qtpzmax').alias('prazo'),
-                F.first('Parcela_Elegivel_Refin').alias('vlrParcelaElegivel')
-        ),
-        "listaApontamentos": F.struct(
-                F.first(F.when(F.col('Apontamento_BX').isNull(), -1).otherwise(F.col('Apontamento_BX').cast(IntegerType())), True).alias('codigo'),
-                F.first(F.when(F.col('dias').isNull(), -1).otherwise(F.col('dias')), True).alias('recencia')
-        ),
-        "indCorrentistaAntigo": F.struct(
-                F.first('CorrentistaAntigo').alias('indCorrentistaAntigo')
-        ),
-        "listaContratos": F.collect_list(
-                F.struct(
-                    F.col('valorTotalParcelaInterno').alias('valorContrato')
-                )
-        ),
-        "numeroConvenio": F.struct(
-                F.first('Numero_Convenio').alias('numeroConvenio')
-        )
-    }
+    # Passo 3: Agrupa por ID da pessoa e aplica funções de janela
+    logger.info("Passo 3: Agrupando dados por ID da pessoa")
+    df_resultado = agrupa_por_id_pessoa(df_resultado)
 
-    resultado_agrupado = resultado_df.groupBy('cod_idef_pess').agg(
-            *[agregacoes[key].alias(key) for key in agregacoes]
+    # Passo 4: Aplica agregações de campo
+    logger.info("Passo 4: Aplicando agregações de campo")
+    df_resultado = agregacoes_campo(df_resultado)
+
+    # Passo 5: Organiza estruturas após agrupamento
+    logger.info("Passo 5: Organizando estrutura JSON final")
+    df_resultado = organiza_estruturas_pos_agrupamento(df_resultado)
+
+    # Passo 6: Formata payload para DMP
+    logger.info("Passo 6: Formatando payload para DMP")
+    df_consig_op_batch = formata_payload_dmp(df_resultado, numero_lote_payload_dmp, logger)
+
+    # Passo 7: Compacta em lotes
+    logger.info("Passo 7: Compactando dados em lotes")
+    df_consig_op_batch = compacta_em_lotes(df_consig_op_batch, numero_lote_payload_dmp)
+
+    # Passo 8: Valida formato de saída
+    logger.info("Passo 8: Validando formato de saída")
+    validate_etl_output_format(df_consig_op_batch, logger)
+
+    write_to_s3(
+        df_consig_op_batch,
+        glue_client_role,
+        database_name_spec,
+        table_name_spec,
+        lake_control_account_id,
+        numero_lote_spec,
+        logger,
+        s3_client,
     )
 
-    return resultado_agrupado
+    logger.info("Fim de execucao do processo")
+    job.commit()
 
-def organiza_estruturas_pos_agrupamento(resultado_df: DataFrame) -> DataFrame:
-    """Organiza estruturas após agrupamento com estrutura JSON completa"""
-    uuid_expr = get_uuid_expr()
-    
-    return resultado_df.select(
-        struct(
-            struct(
-                lit('Decidir análise de crédito PF - Consignado').alias("nom_fncd_serv_nego"),
-                uuid_expr.alias("cod_idef_prpt_sist_prod"),
-                uuid_expr.alias("cod_idef_tran_sist_cred"),
-                lit('Batch').alias("cod_idef_prso_nego"),
-                col("cod_idef_pess").alias("cod_idef_pess"),
-                lit('F').alias("cod_tipo_pess")
-            ).alias("payloadIdentification"),
-            struct(
-                col("dadosOferta").alias("dadosOferta"),
-                lit(0).alias("digitoAleatorio"),
-                col("listaContratos").alias("listaContratos"),
-                col("dadosEndividamento").alias("dadosEndividamento"),
-                col("dadosFatorRisco").alias("dadosFatorRisco"),
-                col("dadosBacen").alias("dadosBacen"),
-                col("dadosModelos").alias("dadosModelos"),
-                col("dadosPessoaFisica").alias("dadosPessoaFisica"),
-                col("dadosRenda").alias("dadosRenda"),
-                col("dadosVisaoCliente").alias("dadosVisaoCliente"),
-                col("listaValoresCalculados").alias("listaValoresCalculados"),
-                col("listaApontamentos").alias("listaApontamentos"),
-                col("indCorrentistaAntigo").alias("indCorrentistaAntigo"),
-                col("numeroConvenio").alias("numeroConvenio")
-            ).alias("payloadInput")
-        ).alias('obj_dmp')
-    )
 
-def compacta_em_lotes(resultado_df: DataFrame, numero_lote_payload_dmp: int) -> DataFrame:
-    """Compacta DataFrame em lotes"""
-    window_spec = Window.orderBy(F.monotonically_increasing_id())
-    
-    resultado_df = resultado_df.withColumn(
-        "row_number",
-        F.row_number().over(window_spec)
-    )
-    
-    resultado_df = resultado_df.withColumn(
-        "batch_number",
-        ((col("row_number") - 1) / numero_lote_payload_dmp).cast(IntegerType())
-    )
-    
-    return resultado_df.groupBy("batch_number").agg(
-        collect_list(col("obj_dmp")).alias("batch_data")
-    )
-
-def set_IndicadorSPI(resultado_df: DataFrame) -> DataFrame:
-    """Define indicador SPI baseado em regras de negócio"""
-    return resultado_df.withColumn(
-        "Indicador_SPI",
-        when(col("Indicador_SPI").isNull(), lit("N"))
-        .otherwise(col("Indicador_SPI"))
-    )
-
-def set_IndicadorSPO(resultado_df: DataFrame) -> DataFrame:
-    """Define indicador SPO baseado em regras de negócio"""
-    return resultado_df.withColumn(
-        "Indicador_SPO",
-        when(col("Indicador_SPO").isNull(), lit("N"))
-        .otherwise(col("Indicador_SPO"))
-    )
-
-def set_indicadorCNAO(resultado_df: DataFrame) -> DataFrame:
-    """Define indicador CNAO baseado em regras de negócio"""
-    return resultado_df.withColumn(
-        "Claro_Nao",
-        when(col("Claro_Nao").isNull(), lit("N"))
-        .otherwise(col("Claro_Nao"))
-    )
-
-def calcula_idade(resultado_df: DataFrame) -> DataFrame:
-    """Calcula idade a partir da data de nascimento"""
-    return resultado_df.withColumn(
-        "Idade",
-        F.floor(F.datediff(F.current_date(), F.to_date(F.col("data_nascimento"), "yyyy-MM-dd")) / 365.25)
-    )
+if __name__ == "__main__":
+    main()
